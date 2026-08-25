@@ -179,8 +179,13 @@ impl Subscription {
     /// `{"type":"pane.created"}` or `{"type":"pane.agent_status_changed","pane_id":"w1:p2"}`.
     ///
     /// Note there is no session-wide agent-status topic: `pane.agent_status_changed`
-    /// requires a `pane_id`, so a watcher has to subscribe per pane and add new
-    /// ones as `pane.created` and `pane.agent_detected` arrive.
+    /// requires a `pane_id`. That sounds like it forces a watcher to subscribe
+    /// per pane and re-subscribe as panes appear — it does not. `pane.updated`
+    /// takes no parameters and carries the whole `PaneInfo`, status included,
+    /// so one subscription covers panes that do not exist yet, with no
+    /// re-subscription churn and no window in which events are missed. Reach
+    /// for the per-pane topic only when you want one specific pane and nothing
+    /// else.
     pub fn open(topics: &[Value]) -> Result<Self> {
         let stream = connect()?;
         // A subscription is long-lived and mostly silent; a read timeout here
