@@ -21,8 +21,10 @@
 # ten milliseconds apart. Six of these racing past the same check produced six
 # live recorders behind one pidfile; `stop` then reported success with five
 # orphans still recording, and `status` said "not running". So `start` takes a
-# lock, re-checks under it, verifies the pidfile it wrote, and `stop` sweeps by
-# pattern rather than trusting that one pid is the whole story.
+# lock, re-checks under it, verifies the pidfile it wrote, and keeps a ledger of
+# every recorder it starts — so `stop` can find the ones the pidfile has stopped
+# naming, and only those. A `sheep watch` this script did not start is somebody
+# else's and is left alone.
 
 set -eu
 
@@ -34,6 +36,8 @@ state_dir=$(sheep_state_dir)
 run_dir="$state_dir/recorder"
 pid_file="$run_dir/watch.pid"
 lock_dir="$run_dir/start.lock"
+# The ledger of recorders this watchd has started. See `our_recorders`.
+pids_file="$run_dir/started.pids"
 
 # Two different logs, and confusing them is how `status` came to advertise a
 # file that holds nothing interesting. `sheep watch` opens its own log — the
@@ -57,28 +61,56 @@ running_pid() {
   printf '%s\n' "$pid"
 }
 
-# What a running recorder's argv looks like, as one extended regular expression
-# both `pgrep -f` and `grep -E` read the same way.
-RECORDER_ARGV='(^|[ /])sheep +watch([ ]|$)'
-
-# Every `sheep watch` this user has running, whatever the pidfile believes.
+# Every recorder THIS watchd started that is still running.
 #
 # The pidfile can only ever name one process, and the race above produced
-# several. This is what lets `stop` mean "stopped" and `status` stop lying.
-# Scoped to this user's processes: a sweep that reached another account's would
-# be a worse bug than the one it fixes.
-recorder_pids() {
-  if command -v pgrep >/dev/null 2>&1; then
-    pgrep -u "$(id -u)" -f "$RECORDER_ARGV" 2>/dev/null || true
-    return 0
-  fi
-  # No pgrep (a stripped container, mostly). shellcheck would rather this were
-  # pgrep too — it is, above; this is the fallback for machines that have not
-  # got it, and `ps -o pid=,args=` is what `running_pid` already reads.
-  # shellcheck disable=SC2009
-  ps -o pid=,args= -u "$(id -u)" 2>/dev/null |
-    grep -E "$RECORDER_ARGV" |
-    awk '{ print $1 }'
+# several, so `stop` needs a second source of truth. It must be a narrow one.
+# Sweeping the process table for `sheep watch` — which is what this did first —
+# reaches across every herdr session on the machine and across a hand-run
+# `sheep watch --dry-run` in another terminal, and a `stop` that kills a
+# recorder it did not start throws away every turn taken until someone notices.
+# That is the loss Sheep exists to prevent; doing it while cleaning up is not a
+# trade worth making.
+#
+# So: a ledger. It cannot be read off the process table instead, because
+# `sheep watch` takes its state directory from the environment and never puts
+# it in argv, and an `env VAR=… sheep watch` wrapper vanishes from argv the
+# moment `env` execs. `start` appends `<pid> <binary>` while holding the lock,
+# so concurrent starts cannot interleave a line between them.
+#
+# A pid on its own would be a trap, because pids are recycled — so an entry
+# counts only while the process it names is still running the binary that entry
+# was written for. `case` rather than `grep`: a path is not a regular
+# expression, and some of them have spaces in.
+our_recorders() {
+  [ -f "$pids_file" ] || return 0
+  while read -r recorded binary; do
+    case "$recorded" in '' | *[!0-9]*) continue ;; esac
+    [ -n "$binary" ] || continue
+    kill -0 "$recorded" 2>/dev/null || continue
+    args=$(ps -p "$recorded" -o args= 2>/dev/null) || continue
+    case "$args" in
+      *"$binary watch"*) printf '%s\n' "$recorded" ;;
+    esac
+  done <"$pids_file"
+}
+
+# Drop ledger entries whose process is gone, so a state directory that lives for
+# months does not accumulate a line per start. Anything still running — including
+# something that ignored a TERM — is kept, so the next `stop` can still find it.
+forget_dead_recorders() {
+  [ -f "$pids_file" ] || return 0
+  # One line per pid becomes one space-separated word list, so the membership
+  # test below can be a plain glob.
+  live=$(our_recorders | tr '\n' ' ') || live=""
+  kept=""
+  while read -r recorded binary; do
+    case " $live " in
+      *" $recorded "*) kept="$kept$recorded $binary
+" ;;
+    esac
+  done <"$pids_file"
+  printf '%s' "$kept" >"$pids_file"
 }
 
 # Take the start lock, or give up on starting.
@@ -169,6 +201,11 @@ start() {
     return 1
   fi
 
+  # And into the ledger, so `stop` can find this one even if the pidfile stops
+  # naming it. Written under the lock, so two starts cannot interleave a line.
+  printf '%s %s\n' "$pid" "$bin" >>"$pids_file"
+  forget_dead_recorders
+
   release_lock
   echo "sheep: recorder started (pid $pid), logging to $watch_log"
 }
@@ -182,16 +219,18 @@ stop() {
   fi
   rm -f "$pid_file"
 
-  # And the sweep. Anything still answering to `sheep watch` once the pidfile's
-  # own process is gone is an orphan, and a `stop` that reports success while
-  # five of them keep recording is worse than no `stop` at all.
-  orphans=$(recorder_pids) || orphans=""
+  # And the sweep. A recorder this watchd started that the pidfile has stopped
+  # naming is an orphan, and a `stop` that reports success while five of them
+  # keep recording is worse than no `stop` at all. Only ours: see
+  # `our_recorders`.
+  orphans=$(our_recorders) || orphans=""
   for orphan in $orphans; do
     if [ "$orphan" != "$pid" ]; then
       kill "$orphan" 2>/dev/null || true
       stopped=$((stopped + 1))
     fi
   done
+  forget_dead_recorders
 
   case "$stopped" in
     0) echo "sheep: recorder is not running" ;;
@@ -201,14 +240,14 @@ stop() {
 }
 
 status() {
-  alive=$(recorder_pids | tr '\n' ' ' | sed 's/ *$//') || alive=""
+  alive=$(our_recorders | tr '\n' ' ' | sed 's/ *$//') || alive=""
   code=0
   if pid=$(running_pid); then
     echo "sheep: recorder running (pid $pid)"
   elif [ -n "$alive" ]; then
-    # Recorders are running but the pidfile does not name any of them. The old
-    # `status` said "not running" here, which is exactly the sentence that hid
-    # five orphans.
+    # Recorders this watchd started are running but the pidfile does not name
+    # any of them. The old `status` said "not running" here, which is exactly
+    # the sentence that hid five orphans.
     echo "sheep: recorder running, but not the one $pid_file names (pid(s) $alive)"
     echo "sheep: \`watchd.sh stop\` sweeps them up"
   else
