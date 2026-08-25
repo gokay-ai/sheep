@@ -53,6 +53,10 @@ enum Command {
     },
     /// Report whether this worktree is safe for Sheep to record and restore.
     Doctor,
+    /// Watch the herdr session and record a turn whenever an agent finishes one.
+    Watch(sheep::herdr::WatchArgs),
+    /// Open Sheep's terminal interface: the timeline dock, or the rewind picker.
+    Ui(sheep::tui::UiArgs),
 }
 
 fn main() {
@@ -68,6 +72,15 @@ fn run() -> Result<()> {
         Some(p) => p.clone(),
         None => std::env::current_dir().context("cannot read the current directory")?,
     };
+    // `watch` supervises a whole session rather than one checkout, and `ui`
+    // resolves its own repository, so neither requires the current directory to
+    // be a worktree.
+    match &cli.command {
+        Command::Watch(args) => return sheep::herdr::cli::run(args),
+        Command::Ui(args) => return sheep::tui::cli::run(args, cli.repo.as_deref(), &cli.line),
+        _ => {}
+    }
+
     let wt = Worktree::discover(&cwd)?;
     let state = repo::state_dir()?;
     let line = &cli.line;
@@ -136,6 +149,8 @@ fn run() -> Result<()> {
             }
             Ok(())
         }
+
+        Command::Watch(_) | Command::Ui(_) => unreachable!("handled above"),
     }
 }
 

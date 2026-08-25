@@ -6,7 +6,9 @@
 //! over it.
 
 pub mod git;
+pub mod herdr;
 pub mod ops;
 pub mod repo;
 pub mod shadow;
 pub mod store;
+pub mod tui;
