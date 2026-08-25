@@ -8,7 +8,7 @@
 use sheep::ops::{self, SnapMeta};
 use sheep::repo::{Worktree, DEFAULT_MAX_FILES};
 use sheep::store::{Store, TurnKind};
-use sheep::tui::app::{App, Key, Level, PlanState};
+use sheep::tui::app::{App, Key, Level, Mode, PlanState};
 use sheep::tui::engine::{self, Action, Ctx, Job, Notice, PlanView, Reply};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -154,9 +154,32 @@ fn app_with_plan() -> App {
 fn no_plan_on_screen_means_no_restore() {
     let mut app = App::new("demo", "/tmp/demo", "default");
     app.apply(Reply::Loaded { turns: vec![], blockers: vec![], warnings: vec![] });
-    // Nothing recorded: enter must not even open the picker.
+    // Nothing recorded: enter must not even open the picker, and must say why
+    // rather than leaving the user on an empty overlay.
     app.on_key(Key::Enter);
     assert!(app.take_jobs().is_empty());
+    assert_eq!(app.mode, Mode::Dock, "there is no plan to show, so there is no overlay to open");
+    assert!(app.status.as_ref().unwrap().lines[0].contains("nothing recorded yet"));
+
+    // A worktree Sheep will not touch is the same: refused, with the blocker's
+    // own words rather than a plan that would fail a second later.
+    let mut app = app_with_plan();
+    app.on_key(Key::Esc);
+    app.apply(Reply::Loaded {
+        turns: app.turns.clone(),
+        blockers: vec!["a rebase is in progress.".into()],
+        warnings: vec![],
+    });
+    app.on_key(Key::Enter);
+    assert!(app.take_jobs().is_empty(), "a blocked worktree must not even be planned against");
+    assert_eq!(app.mode, Mode::Dock);
+    assert!(app
+        .status
+        .as_ref()
+        .unwrap()
+        .lines
+        .iter()
+        .any(|l| l.contains("a rebase is in progress")));
 
     // A plan that is still loading is not a plan anyone has read.
     let mut app = app_with_plan();
@@ -505,8 +528,13 @@ fn the_patch_preview_reads_the_hunks_out_of_the_shadow_repo() {
     }
 }
 
+/// The app's half of the protection: while a restore is in flight, nothing a
+/// key does may queue work. The other half — that keys buffered by the terminal
+/// during the write never get delivered afterwards — is not reachable from here
+/// at all, because an `App` has no input buffer. It lives in the event loop and
+/// is tested in `tui_runtime.rs`.
 #[test]
-fn keys_pressed_during_a_restore_cannot_reach_a_second_write() {
+fn no_key_queues_work_while_a_restore_is_in_flight() {
     let mut app = app_with_plan();
     app.on_key(Key::Char('R'));
     let first: Vec<_> =
@@ -514,28 +542,36 @@ fn keys_pressed_during_a_restore_cannot_reach_a_second_write() {
     assert_eq!(first.len(), 1);
     assert!(app.restoring);
 
-    // Someone leaning on the key for the second the restore takes.
-    for key in [Key::Char('R'), Key::Char('R'), Key::Enter, Key::Char('j'), Key::Char('d')] {
+    // Someone leaning on the key for the second the restore takes, plus every
+    // other key that normally does something.
+    for key in [
+        Key::Char('R'),
+        Key::Char('R'),
+        Key::Enter,
+        Key::Char('j'),
+        Key::Char('d'),
+        Key::Esc,
+        Key::Char('n'),
+        Key::Char('r'),
+    ] {
         app.on_key(key);
     }
     assert!(app.take_jobs().is_empty(), "no keystroke may queue work while a restore is in flight");
     assert!(app.status.as_ref().unwrap().lines[0].contains("keys are ignored"));
+    // The keys that would otherwise have moved the screen out from under the
+    // write did not.
+    assert_eq!(app.mode, Mode::Rewind);
+    assert!(!app.show_patch);
+    assert!(app.notify, "`n` must not have flipped the write-back mid-restore");
 
-    // The tree had moved, so a *different* plan lands on screen. The presses
-    // from a moment ago must not have survived to confirm it.
+    // And the legitimate path is intact: once the worker answers, a deliberate
+    // press on the plan that is now on screen does start a restore.
     let Job::Restore { req, .. } = first[0] else { unreachable!() };
     let mut fresher = plan_view();
     fresher.files.push((Action::Remove, "src/gone.ts".into()));
     fresher.removed = 1;
     app.apply(Reply::Stale { req, plan: fresher });
     assert!(!app.restoring);
-    assert!(
-        !app.take_jobs().iter().any(|j| matches!(j, Job::Restore { .. })),
-        "a queued press must not carry over onto the new plan"
-    );
-
-    // And the legitimate path still works: a deliberate press on the plan that
-    // is now on screen does start a restore.
     app.on_key(Key::Char('R'));
     assert_eq!(app.take_jobs().iter().filter(|j| matches!(j, Job::Restore { .. })).count(), 1);
 }

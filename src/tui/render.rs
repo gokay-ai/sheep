@@ -590,6 +590,10 @@ fn headline(app: &App, width: usize) -> Vec<Line<'static>> {
         lines.push(Line::from(Span::styled(text::truncate(&text_, width), style)));
     }
     lines.push(counts);
+    // The overlay covers the dock, status panel included — so a refusal that
+    // only wrote to `app.status` used to be invisible on the one screen it was
+    // about. It belongs directly under the counts, where the eye already is.
+    lines.extend(status_block(app, width));
     lines.push(rule(width));
     lines
 }

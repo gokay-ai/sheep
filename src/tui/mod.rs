@@ -19,6 +19,7 @@
 //! | [`app`] | no | no |
 //! | [`render`] | no | draws, reads nothing |
 //! | [`engine`] | yes — it is the only place that does | no |
+//! | [`runtime`] | no | only through [`runtime::Screen`] / [`runtime::Input`] |
 //! | [`cli`] | no | owns it |
 //!
 //! Which is why the whole interface, restore included, is testable with
@@ -28,6 +29,7 @@ pub mod app;
 pub mod cli;
 pub mod engine;
 pub mod render;
+pub mod runtime;
 pub mod text;
 pub mod theme;
 

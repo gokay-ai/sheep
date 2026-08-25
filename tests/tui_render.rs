@@ -338,6 +338,71 @@ fn the_patch_pane_shows_the_hunks_a_restore_would_apply() {
     shows(&narrow, "@@ -1 +1,4 @@");
 }
 
+/// The screen the status line now tells people to read. Its file list and its
+/// diff pane have to describe the same plan; they used to describe two.
+#[test]
+fn the_refusal_screen_does_not_leave_the_previous_plans_diff_beside_the_new_one() {
+    let mut app = demo();
+    app.on_key(Key::Down);
+    open_rewind(&mut app, plan_view());
+
+    // Open the diff and answer the patch it asks for.
+    app.on_key(Key::Char('d'));
+    let jobs = app.take_jobs();
+    let Some(Job::Patch { req, path, .. }) = jobs.first().cloned() else {
+        panic!("opening the diff should ask for a patch, got {jobs:?}")
+    };
+    assert_eq!(path, "src/api/cart.ts");
+    app.apply(Reply::Patched {
+        req,
+        path,
+        body: "@@ -1 +1 @@\n-the patch for the plan that was on screen".into(),
+    });
+    shows(&frame(&app, 100, 26), "the patch for the plan that was on screen");
+
+    // Press the key; the worker refuses because the agent kept working.
+    app.on_key(Key::Char('R'));
+    let jobs = app.take_jobs();
+    let Some(Job::Restore { req, .. }) =
+        jobs.into_iter().find(|j| matches!(j, Job::Restore { .. }))
+    else {
+        panic!("no restore job")
+    };
+    let fresher = PlanView {
+        seq: 2,
+        commit: "2faeca7e387e0000000000000000000000000000".into(),
+        target_tree: "tt".into(),
+        current_tree: "moved".into(),
+        written: 1,
+        removed: 1,
+        files: vec![
+            (Action::Write, "src/api/order.ts".into()),
+            (Action::Remove, "src/api/agent-wrote-this.ts".into()),
+        ],
+    };
+    app.apply(Reply::Stale { req, plan: fresher });
+
+    let screen = frame(&app, 100, 26);
+    shows(&screen, "nothing was restored");
+    // the new plan
+    shows(&screen, "+ src/api/order.ts");
+    shows(&screen, "− src/api/agent-wrote-this.ts");
+    // and no trace of the old one, in either pane
+    hides(&screen, "the patch for the plan that was on screen");
+    hides(&screen, "src/api/cart.ts");
+    // the pane is still open, and now points at the new plan's first file
+    assert!(app.show_patch);
+    let asked: Vec<String> = app
+        .take_jobs()
+        .into_iter()
+        .filter_map(|j| match j {
+            Job::Patch { path, .. } => Some(path),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(asked, vec!["src/api/order.ts"], "the refusal has to refetch the evidence");
+}
+
 #[test]
 fn the_help_overlay_documents_the_restore_key() {
     let mut app = demo();

@@ -454,10 +454,7 @@ impl App {
             }
             Reply::Planned { req, plan } => {
                 if req == self.plan_req {
-                    self.plan_sel = 0;
-                    self.patch_cache.clear();
-                    self.plan = PlanState::Ready(plan);
-                    self.request_patch();
+                    self.show_plan(plan);
                 }
             }
             Reply::PlanFailed { req, seq, message } => {
@@ -479,9 +476,7 @@ impl App {
             Reply::Stale { req, plan } => {
                 if req == self.restore_req {
                     self.restoring = false;
-                    self.plan_sel = 0;
-                    self.patch_cache.clear();
-                    self.plan = PlanState::Ready(plan);
+                    self.show_plan(plan);
                     self.status = Some(Status::new(
                         Level::Bad,
                         [
@@ -513,6 +508,23 @@ impl App {
                 }
             }
         }
+    }
+
+    /// Put a plan on screen, with the evidence beside it made to match.
+    ///
+    /// Both the plan a user asked for and the one a refusal hands back arrive
+    /// here. They used to be two arms that each reset a slightly different set
+    /// of fields, and the refusal path forgot the patch pane — so the screen the
+    /// status line tells you to read ("this is the new plan") showed the new
+    /// plan's files beside the previous plan's diff, computed against a tree
+    /// that no longer existed. One function, so they cannot drift apart again.
+    fn show_plan(&mut self, plan: PlanView) {
+        self.plan_sel = 0;
+        self.patch_scroll = 0;
+        self.patch = PatchState::Idle;
+        self.patch_cache.clear();
+        self.plan = PlanState::Ready(plan);
+        self.request_patch();
     }
 
     fn set_turns(&mut self, turns: Vec<Turn>) {
