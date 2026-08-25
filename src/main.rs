@@ -15,7 +15,12 @@ struct Cli {
     #[arg(long, short = 'C', global = true)]
     repo: Option<PathBuf>,
     /// Timeline to record against. One per agent pane; `default` when standalone.
-    #[arg(long, global = true, default_value = "default")]
+    ///
+    /// Also read from `SHEEP_LINE`, which is how a herdr pane learns which
+    /// agent's timeline it belongs to: a pane's command line is fixed in the
+    /// plugin manifest, so the only way to tell one dock from another is the
+    /// environment the pane is opened with.
+    #[arg(long, global = true, env = "SHEEP_LINE", default_value = "default")]
     line: String,
     /// Refuse to touch a worktree with more tracked files than this.
     #[arg(long, global = true, default_value_t = DEFAULT_MAX_FILES)]
