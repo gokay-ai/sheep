@@ -442,6 +442,34 @@ fn empty_state(app: &App, width: usize) -> Vec<Line<'static>> {
         )),
         Line::raw(""),
     ];
+    // The whole point of this branch. An empty timeline beside a worktree that
+    // has other, non-empty ones is not "nothing has happened yet" — it is a
+    // dock pointed at the wrong name, which is exactly how the recorder and
+    // this pane once disagreed without anyone noticing. Say what else is here
+    // and how to open it, before offering to record anything new.
+    if !app.others.is_empty() {
+        for chunk in text::wrap(
+            &format!("but this worktree has: {}", app.others.join(", ")),
+            width.saturating_sub(2),
+        ) {
+            lines.push(Line::from(Span::styled(format!(" {chunk}"), theme::strong())));
+        }
+        lines.push(Line::from(vec![
+            Span::raw(" "),
+            Span::styled(
+                text::truncate(
+                    &format!("sheep ui --line {}", app.others[0]),
+                    width.saturating_sub(2),
+                ),
+                theme::accent(),
+            ),
+            Span::styled(
+                text::truncate("  opens that one", width.saturating_sub(20)),
+                theme::dim(),
+            ),
+        ]));
+        lines.push(Line::raw(""));
+    }
     for (cmd, what) in
         [("sheep snap", "record the tree as it is now"), ("sheep watch", "record every agent turn")]
     {

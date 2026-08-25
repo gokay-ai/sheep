@@ -123,24 +123,22 @@ target_triple() {
         *) echo "" ;;
       esac
       ;;
-    # Git Bash / MSYS2 / Cygwin. The normal Windows path is install.ps1, but a
-    # hand-run of this script from one of those shells should still work.
-    MINGW* | MSYS* | CYGWIN*)
-      case "$uname_m" in
-        x86_64 | amd64) echo x86_64-pc-windows-msvc ;;
-        *) echo "" ;;
-      esac
-      ;;
+    # Git Bash / MSYS2 / Cygwin used to resolve a windows-msvc asset here.
+    # Sheep no longer builds one: the recorder is herdr's session API and there
+    # is no non-unix transport for it, so a Windows binary could not record a
+    # turn. Falling through to "no prebuilt binary" says that plainly instead of
+    # installing something that starts and then does nothing.
     *) echo "" ;;
   esac
 }
 
 triple=$(target_triple)
 
+# Every target Sheep ships is unix, so there is no executable suffix to add.
+# Kept as a variable rather than deleted because the source-build path below and
+# the asset name both interpolate it, and one of them will need it again the day
+# a Windows target comes back.
 exe_suffix=""
-case "$triple" in
-  *-windows-*) exe_suffix=".exe" ;;
-esac
 
 # --- which version -----------------------------------------------------------
 
@@ -201,9 +199,11 @@ if [ "$from_source" = 1 ]; then
 fi
 
 [ -n "$triple" ] || die "no prebuilt sheep binary for $uname_s/$uname_m.
-  Prebuilt platforms are macOS (arm64, x86_64), Linux (x86_64 gnu/musl, aarch64
-  gnu) and Windows x86_64. Re-run as \`SHEEP_FROM_SOURCE=1 herdr plugin install\`
-  (or \`./install.sh --from-source\`) to build it with cargo instead."
+  Prebuilt platforms are macOS (arm64, x86_64) and Linux (x86_64 gnu/musl,
+  aarch64 gnu). Windows is not one of them: Sheep's recorder needs herdr's unix
+  socket API and has no transport for it there yet. Re-run as
+  \`SHEEP_FROM_SOURCE=1 herdr plugin install\` (or \`./install.sh --from-source\`)
+  to build it with cargo instead."
 
 # --- already installed? ------------------------------------------------------
 

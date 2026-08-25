@@ -223,7 +223,12 @@ fn plan(files: &[(Action, &str)]) -> PlanView {
 fn ready() -> App {
     let mut app = App::new("demo", "/tmp/demo", "default");
     app.inside_herdr = true;
-    app.apply(Reply::Loaded { turns: vec![turn(1)], blockers: vec![], warnings: vec![] });
+    app.apply(Reply::Loaded {
+        turns: vec![turn(1)],
+        blockers: vec![],
+        warnings: vec![],
+        others: vec![],
+    });
     app.on_key(Key::Enter);
     let jobs = app.take_jobs();
     let Some(Job::Plan { req, .. }) = jobs.first().cloned() else { panic!("no plan job") };

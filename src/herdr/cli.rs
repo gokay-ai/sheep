@@ -68,6 +68,21 @@ impl WatchArgs {
 }
 
 pub fn run(args: &WatchArgs) -> Result<()> {
+    // Everything below is herdr's socket API and nothing else — `agent.list`,
+    // `pane.get`, `pane.read`, `events.subscribe`, and the write-back that
+    // tells an agent what a restore took back all go through `wire::connect`,
+    // which has no non-unix implementation. Without this the loop opens, fails
+    // to subscribe, retries until the supervisor gives up, and exits 0: a
+    // recorder that reported "started", recorded nothing, and left an empty
+    // timeline nobody could tell from a quiet one. Refusing at startup is the
+    // difference between a feature that is missing and a claim that is false.
+    if !cfg!(unix) {
+        bail!(
+            "`sheep watch` is not supported on Windows yet.\nherdr's session API is a unix \
+             socket and Sheep has no transport for it on this platform, so there is no way to see \
+             an agent finish a turn. `sheep snap` records a turn by hand."
+        );
+    }
     if !wire::inside_herdr() {
         bail!(
             "`sheep watch` records what herdr sees, so it has to run inside a herdr session.\nStart it from a herdr pane, or use `sheep snap` to record a turn by hand."

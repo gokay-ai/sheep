@@ -64,6 +64,28 @@ pub enum LineBy {
     Pane,
 }
 
+impl LineBy {
+    /// The timeline a pane records on.
+    ///
+    /// The rule lives here rather than inside the recorder because the herdr
+    /// plugin has to arrive at the same string from the other side — a dock
+    /// pane knows only what herdr put in its invocation context — and a rule
+    /// stated in two places is a rule that drifts. `herdr-plugin/scripts/
+    /// common.sh:sheep_target_line` is the other statement of it, and
+    /// `tests/plugin_timeline.rs` runs the two against each other.
+    ///
+    /// Handed on raw: [`crate::store::slug`] is what makes a name safe as both
+    /// a file name and a git ref, and both the turn log and the shadow
+    /// repository call it, so cleaning it here as well would only produce a
+    /// second, different answer.
+    pub fn timeline(self, pane_id: &str, agent: Option<&str>) -> String {
+        match self {
+            LineBy::Agent => agent.unwrap_or("agent").to_string(),
+            LineBy::Pane => pane_id.to_string(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     /// Print boundaries instead of recording them. Writes nothing, anywhere.
@@ -672,17 +694,9 @@ impl<S: Session> Recorder<S> {
         Verdict::Settled
     }
 
-    /// The timeline a pane records on.
-    ///
-    /// Handed on raw: [`crate::store::slug`] is what makes a name safe as both
-    /// a file name and a git ref, and both the turn log and the shadow
-    /// repository call it, so cleaning it here as well would only produce a
-    /// second, different answer.
+    /// The timeline a pane records on. See [`LineBy::timeline`].
     fn timeline(&self, pane_id: &str, agent: Option<&str>) -> String {
-        match self.config.line_by {
-            LineBy::Agent => agent.unwrap_or("agent").to_string(),
-            LineBy::Pane => pane_id.to_string(),
-        }
+        self.config.line_by.timeline(pane_id, agent)
     }
 
     fn worktree(&mut self, cwd: &str) -> Option<Worktree> {
