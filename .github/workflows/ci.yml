@@ -1,0 +1,88 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Only the checkout is needed; nothing here writes to the repository.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: fmt + clippy + test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo fmt --check
+
+      # All three legs run clippy on purpose: `-D warnings` fires on different
+      # code per platform, so a cfg(unix)-only helper that is dead on Windows
+      # only ever fails the Windows leg.
+      - run: cargo clippy --all-targets --locked -- -D warnings
+
+      - run: cargo test --locked
+
+  plugin:
+    name: plugin manifest + installer
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: shellcheck
+        run: shellcheck herdr-plugin/install.sh herdr-plugin/scripts/*.sh
+
+      # Exercises install.sh's platform detection against faked uname output and
+      # cross-checks the asset names it resolves against the target list in
+      # release.yml. That round trip is the thing most likely to silently rot:
+      # rename a target in the release matrix and this fails on the next push
+      # rather than on the next user's install.
+      - name: installer platform detection
+        run: bash herdr-plugin/scripts/test-install.sh
+
+      - name: manifest and crate versions agree
+        run: |
+          set -eu
+          crate=$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' Cargo.toml | head -n 1)
+          manifest=$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' herdr-plugin/herdr-plugin.toml | head -n 1)
+          echo "crate=$crate manifest=$manifest"
+          test "$crate" = "$manifest"
+
+  plugin-windows:
+    name: plugin installer (windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: PSScriptAnalyzer
+        shell: pwsh
+        run: |
+          Install-Module PSScriptAnalyzer -Force -Scope CurrentUser -ErrorAction Stop
+          $results = Invoke-ScriptAnalyzer -Path herdr-plugin -Recurse -Severity Error
+          if ($results) { $results | Format-Table -AutoSize | Out-String | Write-Host; exit 1 }
+
+      # No network and no release to fetch from, so this only proves the script
+      # parses, finds the manifest and resolves the Windows asset name.
+      - name: installer dry run
+        shell: pwsh
+        run: |
+          $output = & .\herdr-plugin\install.ps1 -DryRun
+          $output | Write-Host
+          if (-not ($output -match 'sheep-x86_64-pc-windows-msvc\.exe')) {
+            throw 'install.ps1 did not resolve the expected Windows asset name'
+          }

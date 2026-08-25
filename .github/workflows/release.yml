@@ -1,0 +1,151 @@
+name: Release
+
+# Cut a release by tagging: the tag is the source of truth and every job below
+# refuses to run if Cargo.toml, Cargo.lock and herdr-plugin.toml disagree with
+# it. `herdr-plugin/install.sh` reads the plugin manifest's version and fetches
+# `v<version>` — that is the whole contract between this file and the installer.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # macOS: the runner is arm64, and the x86_64 leg is the one piece of
+          # real cross-compilation here — the Apple toolchain does it natively,
+          # so it needs nothing but `rustup target add`.
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          # 22.04 rather than latest for the glibc floor: a binary linked
+          # against 24.04's glibc 2.39 refuses to start on anything older, and
+          # a plugin install is exactly where that failure is least debuggable.
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+          # Native arm64 runner instead of a cross toolchain. Cross-linking
+          # aarch64 is the target that most often needs help; not doing it at
+          # all is more reliable than doing it well. (These runners are free for
+          # public repositories; a private fork should swap in
+          # taiki-e/setup-cross-toolchain-action on ubuntu-22.04 instead.)
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04-arm
+          # musl is fully static, so this one runs anywhere x86_64 Linux does —
+          # Alpine included, where the gnu build cannot start at all.
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-22.04
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Tag, crate, lockfile and manifest versions agree
+        shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -eu
+          version="${TAG#v}"
+          crate=$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' Cargo.toml | head -n 1)
+          manifest=$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' herdr-plugin/herdr-plugin.toml | head -n 1)
+          lock=$(awk '/^name = "sheep"$/ { getline; sub(/^version = "/, ""); sub(/"$/, ""); print; exit }' Cargo.lock)
+          echo "tag=$version crate=$crate manifest=$manifest lock=$lock"
+          test "$version" = "$crate"
+          test "$version" = "$manifest"
+          test "$version" = "$lock"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install the musl linker
+        if: endsWith(matrix.target, '-musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Stage the asset and its checksum
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -eu
+          suffix=""
+          case "$TARGET" in
+            *windows*) suffix=".exe" ;;
+          esac
+          asset="sheep-$TARGET$suffix"
+          mkdir -p dist
+          cp "target/$TARGET/release/sheep$suffix" "dist/$asset"
+          cd dist
+          # Both spellings produce "<hash>  <name>"; install.sh accepts either.
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$asset" >"$asset.sha256"
+          else
+            shasum -a 256 "$asset" >"$asset.sha256"
+          fi
+          cat "$asset.sha256"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: sheep-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: publish the release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+
+      - name: Assemble the release files
+        run: |
+          set -eu
+          mkdir -p release
+          find artifacts -type f -name 'sheep-*' ! -name '*.sha256' -exec cp {} release/ \;
+          # One SHA256SUMS for every asset — this is the file install.sh fetches
+          # first and refuses to install without.
+          cat artifacts/*/*.sha256 >release/SHA256SUMS
+          ls -l release
+          cat release/SHA256SUMS
+
+      # The round trip: every target the matrix built must be an asset name that
+      # install.sh will actually ask for, and every asset install.sh can ask for
+      # must be here. A rename on either side fails the release, not an install.
+      - name: Assets match what install.sh asks for
+        run: bash herdr-plugin/scripts/test-install.sh --release-dir release
+
+      - name: Create or update the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -eu
+          gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1 ||
+            gh release create "$TAG" --repo "$REPO" --title "$TAG" --generate-notes --draft
+          gh release upload "$TAG" release/* --clobber --repo "$REPO"
+          gh release edit "$TAG" --draft=false --repo "$REPO"

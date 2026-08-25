@@ -1,0 +1,22 @@
+# Windows contributors plus `core.autocrlf=true` is a normal combination, and a
+# shell script that reaches a Linux or macOS machine with CRLF endings fails
+# before its first line runs — `bash install.sh` reports "\r: command not found"
+# if you are lucky and something stranger if you are not. herdr runs install.sh
+# and every scripts/*.sh through bash on those platforms, so normalise the whole
+# tree to LF and pin the scripts explicitly.
+* text=auto eol=lf
+
+*.sh text eol=lf
+*.ps1 text eol=lf
+*.rs text eol=lf
+*.toml text eol=lf
+*.yml text eol=lf
+*.md text eol=lf
+Cargo.lock text eol=lf
+LICENSE text eol=lf
+
+# Batch files are the one place CRLF actually matters: cmd.exe has historically
+# mis-parsed LF-only labels and `goto` targets. None are shipped today; this is
+# here so the first one does not have to rediscover it.
+*.bat text eol=crlf
+*.cmd text eol=crlf
