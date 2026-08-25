@@ -832,6 +832,123 @@ fn collection_never_leaves_a_timeline_empty() {
 }
 
 #[test]
+fn an_age_policy_that_outruns_every_turn_still_leaves_one_to_rewind_to() {
+    // The ordinary command, on an ordinary checkout: `sheep gc
+    // --max-age-days 30 --yes` on a month-old repository. Every turn is past
+    // the cutoff, so the filter keeps nothing, and without the fallback a
+    // single command deletes the ref, the log and the objects and reports
+    // `0 kept` — a history the user can still see on screen and can no longer
+    // reach.
+    //
+    // Asserted as the property rather than as a count, because a count is what
+    // hid this: turns recorded in the same second as the collection compare
+    // `at >= cutoff` equal and survive on their own, so a test that collects
+    // immediately after recording passes with or without the fallback.
+    let f = Fixture::new();
+    f.write("a.txt", "base\n");
+    f.commit_all("base");
+    record_turns(&f, "default", 3);
+
+    // Backdate the log. `at` is what the age policy reads, and a month-old
+    // checkout is the case; forging the clock is the only way to have one in a
+    // test that runs in a second.
+    let store = sheep::store::Store::open(&f.state, &f.wt().id, "default").unwrap();
+    let mut turns = store.all().unwrap();
+    for turn in &mut turns {
+        turn.at -= 40 * 86_400;
+    }
+    store.rewrite(&turns).unwrap();
+    let newest = turns.last().unwrap().clone();
+
+    let report = ops::collect(
+        &f.wt(),
+        &f.state,
+        "default",
+        // The default policy, spelled out: this is what `sheep gc --yes` does.
+        ops::Retention { keep: 500, max_age_days: Some(30) },
+        true,
+    )
+    .unwrap();
+    assert_eq!(report.kept, 1, "the newest turn is always kept, whatever the age policy says");
+    assert_eq!(report.dropped, 2);
+
+    let after = store.all().unwrap();
+    assert_eq!(after.len(), 1, "the log must not be emptied: {after:?}");
+    assert_eq!(after[0].seq, newest.seq, "and what is left must be the newest turn");
+    assert_eq!(after[0].tree, newest.tree, "pointing at the tree it always pointed at");
+
+    // The objects, which is the half a count would not have noticed: `gc
+    // --prune=now` follows the ref, and a ref that was deleted takes every
+    // blob with it.
+    let shadow = sheep::shadow::Shadow::ensure(f.wt(), &f.state).unwrap();
+    assert!(shadow.head("default").unwrap().is_some(), "the timeline's ref must survive");
+    assert!(
+        shadow.verify(&after[0].tree).unwrap().is_empty(),
+        "every object of the surviving turn must still be readable"
+    );
+
+    // And the only thing any of it was for.
+    f.write("a.txt", "and then this happened\n");
+    ops::restore(&f.wt(), &f.state, "default", &after[0].seq.to_string(), BUDGET).unwrap();
+    assert_eq!(f.read("a.txt"), "revision 2\n");
+}
+
+#[test]
+fn two_worktrees_with_the_same_name_do_not_share_one_history() {
+    // Herdr's whole model is a worktree per agent, so a session is full of
+    // linked worktrees called `fix` that share one object database. The id
+    // naming the shadow repository and the turn log is derived from the path,
+    // and it carries a hash of that path for exactly this reason: with only the
+    // directory name, two checkouts collapse onto one history, `#1` means a
+    // different tree depending on where you are standing, and a restore in one
+    // writes the other's whole tree over it and reports success.
+    let f = Fixture::new();
+    f.write("shared.txt", "main\n");
+    f.commit_all("base");
+
+    let a = f.repo.parent().unwrap().join("agent-a").join("fix");
+    let b = f.repo.parent().unwrap().join("agent-b").join("fix");
+    for (path, branch) in [(&a, "fix-a"), (&b, "fix-b")] {
+        git(&f.repo, &["worktree", "add", "--quiet", "-b", branch, path.to_str().unwrap()]);
+    }
+    assert_eq!(a.file_name(), b.file_name(), "the two checkouts must share a directory name");
+
+    // Each agent does its own work in its own checkout.
+    fs::write(a.join("shared.txt"), "A\n").unwrap();
+    fs::write(a.join("a-only.txt"), "agent A's work\n").unwrap();
+    fs::write(b.join("shared.txt"), "B\n").unwrap();
+    fs::write(b.join("b-only.txt"), "agent B's work\n").unwrap();
+
+    let wt_a = Worktree::discover(&a).unwrap();
+    let wt_b = Worktree::discover(&b).unwrap();
+    let in_a = f.snap_in(&wt_a, "agent A's turn");
+    let in_b = f.snap_in(&wt_b, "agent B's turn");
+
+    // In B, B's own first turn — which is the tree B is already sitting on, so
+    // this must do nothing at all. Asserted on the files before anything is
+    // asserted about ids, because the files are the damage.
+    ops::restore(&wt_b, &f.state, "default", "#1", BUDGET).unwrap();
+
+    assert_eq!(
+        fs::read_to_string(b.join("shared.txt")).unwrap(),
+        "B\n",
+        "a restore in one checkout must never write another checkout's tree over it"
+    );
+    assert!(b.join("b-only.txt").exists(), "and must not delete this checkout's own work");
+    assert!(!b.join("a-only.txt").exists(), "and must not import the other checkout's files");
+    // A is untouched in both directions.
+    assert_eq!(fs::read_to_string(a.join("shared.txt")).unwrap(), "A\n");
+    assert!(a.join("a-only.txt").exists());
+
+    assert_eq!(in_a, 1);
+    assert_eq!(in_b, 1, "B's timeline starts at #1; it is not a continuation of A's");
+    assert_ne!(
+        wt_a.id, wt_b.id,
+        "two checkouts with the same directory name must not name the same state"
+    );
+}
+
+#[test]
 fn recording_continues_from_where_collection_left_off() {
     let f = Fixture::new();
     f.write("a.txt", "base\n");

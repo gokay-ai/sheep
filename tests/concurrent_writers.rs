@@ -136,10 +136,7 @@ impl Fixture {
             .into_iter()
             .find(|t| t.seq == seq)
             .unwrap_or_else(|| panic!("{what}: #{seq} is not in the log any more"));
-        assert_eq!(
-            turn.tree, tree,
-            "{what}: #{seq} must still hold the tree it was recorded with"
-        );
+        assert_eq!(turn.tree, tree, "{what}: #{seq} must still hold the tree it was recorded with");
 
         let shadow = Shadow::ensure(self.wt(), &self.state).unwrap();
         let missing = shadow.verify(&turn.tree).expect("verify should run");
@@ -226,6 +223,39 @@ fn a_restore_beside_a_collection_keeps_the_checkpoint_it_promised() {
         .expect("`sheep restore #<checkpoint>` must put it back");
     assert_eq!(f.read("a.txt"), "work the restore is about to take back\n");
     assert_eq!(f.read("unsaved.txt"), "never snapshotted by anyone\n");
+}
+
+#[test]
+fn a_writer_that_cannot_have_the_lock_is_told_so_rather_than_left_waiting() {
+    // What contention costs, stated. A recorder must not stall a session, so
+    // the wait is bounded and the answer is a `lock::Busy` — its own error type
+    // precisely so that "somebody else is writing, try again" can be told apart
+    // from "this worktree is not safe to record". Nothing is written on the way
+    // past.
+    let f = Fixture::new();
+    f.write("a.txt", "one\n");
+    f.snap("the first turn");
+    let before = f.turns().len();
+
+    let held = sheep::lock::hold(&f.state, &f.wt().id, Duration::from_millis(50))
+        .expect("the lock should be free");
+
+    f.write("a.txt", "two\n");
+    let started = Instant::now();
+    let err =
+        ops::snap(&f.wt(), &f.state, LINE, BUDGET, TurnKind::Turn, SnapMeta::default(), false)
+            .expect_err("a snapshot cannot record while someone else holds the lock");
+
+    assert!(ops::is_busy(&err), "contention must be its own error, not a general failure: {err:#}");
+    assert!(
+        started.elapsed() < Duration::from_secs(30),
+        "the wait has to be bounded: a recorder that blocks for ever stalls the session"
+    );
+    assert_eq!(f.turns().len(), before, "and nothing may be half-written on the way out");
+
+    drop(held);
+    f.snap("and now it records");
+    assert_eq!(f.turns().len(), before + 1);
 }
 
 #[test]

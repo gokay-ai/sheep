@@ -5,7 +5,7 @@
 //! is ambiguous.
 
 use crate::git::{canonical, Git};
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
@@ -254,23 +254,167 @@ pub fn inspect(wt: &Worktree, max_files: usize) -> Result<Health> {
 
 /// Where Sheep keeps its state. Inside herdr this is handed to us; outside it,
 /// we fall back to the platform's state directory so `sheep` works standalone.
+///
+/// Precedence, highest first: `HERDR_PLUGIN_STATE_DIR`, `SHEEP_STATE_DIR`,
+/// `XDG_STATE_HOME`, then the platform's own home. On Windows that is
+/// `%LOCALAPPDATA%` before `%USERPROFILE%`, and both before `HOME`: a Windows
+/// user has `HOME` only when the shell invents one, so preferring it would mean
+/// turns recorded from Git Bash were invisible from PowerShell.
 pub fn state_dir() -> Result<PathBuf> {
-    if let Ok(dir) = std::env::var("HERDR_PLUGIN_STATE_DIR") {
-        if !dir.is_empty() {
-            return Ok(PathBuf::from(dir));
+    state_dir_from(|var| std::env::var(var).ok(), cfg!(windows))
+}
+
+/// The lookup behind [`state_dir`], with the environment and the platform
+/// passed in so both can be tested without touching either.
+fn state_dir_from(env: impl Fn(&str) -> Option<String>, windows: bool) -> Result<PathBuf> {
+    // The variables consulted, in order, each with what is appended to it. An
+    // empty suffix means the variable names the state directory itself.
+    //
+    // As data rather than as a chain of `if let`s, because the error is
+    // generated from the same list: the message used to name two of the four
+    // and omit `SHEEP_STATE_DIR`, which is the one that would have fixed it.
+    let mut sources: Vec<(&str, &[&str])> = vec![
+        ("HERDR_PLUGIN_STATE_DIR", &[]),
+        ("SHEEP_STATE_DIR", &[]),
+        ("XDG_STATE_HOME", &["sheep"]),
+    ];
+    if windows {
+        sources.push(("LOCALAPPDATA", &["sheep"]));
+        sources.push(("USERPROFILE", &["AppData", "Local", "sheep"]));
+    }
+    sources.push(("HOME", &[".local", "state", "sheep"]));
+
+    for (var, suffix) in &sources {
+        // Empty is unset. A variable exported as `""` would otherwise put the
+        // state directory somewhere relative to whatever the process's working
+        // directory happened to be.
+        let Some(value) = env(var).filter(|value| !value.is_empty()) else { continue };
+        let mut path = PathBuf::from(value);
+        path.extend(*suffix);
+        return Ok(path);
+    }
+
+    let names: Vec<&str> = sources.iter().map(|(var, _)| *var).collect();
+    bail!(
+        "cannot work out where to keep Sheep's state: none of {} is set.\nSet SHEEP_STATE_DIR to a directory Sheep may write to.",
+        names.join(", ")
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::state_dir_from;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    /// Every variable `state_dir` consults, so that a test can walk them
+    /// without repeating the order the function itself defines.
+    const UNIX: [&str; 4] = ["HERDR_PLUGIN_STATE_DIR", "SHEEP_STATE_DIR", "XDG_STATE_HOME", "HOME"];
+    const WINDOWS_ONLY: [&str; 2] = ["LOCALAPPDATA", "USERPROFILE"];
+
+    fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let map: HashMap<String, String> =
+            pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        move |var: &str| map.get(var).cloned()
+    }
+
+    #[test]
+    fn the_state_directory_is_named_by_the_first_variable_that_is_set() {
+        let all = env(&[
+            ("HERDR_PLUGIN_STATE_DIR", "/herdr"),
+            ("SHEEP_STATE_DIR", "/sheep"),
+            ("XDG_STATE_HOME", "/xdg"),
+            ("HOME", "/home/a"),
+        ]);
+        assert_eq!(state_dir_from(&all, false).unwrap(), PathBuf::from("/herdr"));
+
+        let without_herdr =
+            env(&[("SHEEP_STATE_DIR", "/sheep"), ("XDG_STATE_HOME", "/xdg"), ("HOME", "/home/a")]);
+        assert_eq!(state_dir_from(&without_herdr, false).unwrap(), PathBuf::from("/sheep"));
+
+        let xdg = env(&[("XDG_STATE_HOME", "/xdg"), ("HOME", "/home/a")]);
+        assert_eq!(state_dir_from(&xdg, false).unwrap(), PathBuf::from("/xdg/sheep"));
+
+        let home = env(&[("HOME", "/home/a")]);
+        assert_eq!(
+            state_dir_from(&home, false).unwrap(),
+            PathBuf::from("/home/a/.local/state/sheep")
+        );
+    }
+
+    #[test]
+    fn a_variable_set_to_nothing_counts_as_unset() {
+        // Exported as `""` — which is what a shell script does when it passes
+        // an unset variable on — the state directory would otherwise be
+        // relative to whatever directory the process happened to start in.
+        let empty = env(&[("SHEEP_STATE_DIR", ""), ("HOME", "/home/a")]);
+        assert_eq!(
+            state_dir_from(&empty, false).unwrap(),
+            PathBuf::from("/home/a/.local/state/sheep"),
+            "an empty variable must not name a relative state directory"
+        );
+    }
+
+    #[test]
+    fn windows_has_somewhere_to_put_it_without_home() {
+        // The case that used to be HOME-or-bust. A Windows shell that never
+        // sets HOME left `sheep` with nowhere to record, and an error naming
+        // two variables, neither of which Windows has.
+        let local = env(&[("LOCALAPPDATA", "C:\\Users\\a\\AppData\\Local")]);
+        assert_eq!(
+            state_dir_from(&local, true).unwrap(),
+            PathBuf::from("C:\\Users\\a\\AppData\\Local").join("sheep")
+        );
+
+        let profile = env(&[("USERPROFILE", "C:\\Users\\a")]);
+        assert_eq!(
+            state_dir_from(&profile, true).unwrap(),
+            PathBuf::from("C:\\Users\\a").join("AppData").join("Local").join("sheep")
+        );
+
+        // A Git Bash `HOME` must not win over the location every other shell on
+        // the machine agrees on, or turns recorded in one are invisible in the
+        // other.
+        let both = env(&[("LOCALAPPDATA", "C:\\Local"), ("HOME", "/c/Users/a")]);
+        assert_eq!(state_dir_from(&both, true).unwrap(), PathBuf::from("C:\\Local").join("sheep"));
+
+        // And none of it changes anything anywhere else.
+        assert_eq!(
+            state_dir_from(env(&[("LOCALAPPDATA", "C:\\Local"), ("HOME", "/home/a")]), false)
+                .unwrap(),
+            PathBuf::from("/home/a/.local/state/sheep")
+        );
+    }
+
+    #[test]
+    fn the_error_names_every_variable_it_looked_at() {
+        // The bug this replaces: the message named `HERDR_PLUGIN_STATE_DIR` and
+        // `HOME`, and left out `SHEEP_STATE_DIR` — the one variable a user
+        // could have set to get out of it.
+        for (windows, expected) in [
+            (false, UNIX.to_vec()),
+            (true, UNIX.iter().chain(WINDOWS_ONLY.iter()).copied().collect()),
+        ] {
+            let err = state_dir_from(env(&[]), windows)
+                .expect_err("with nothing set there is nowhere to record");
+            let message = format!("{err:#}");
+            for var in &expected {
+                assert!(
+                    message.contains(var),
+                    "the error must name {var}, the user's way out of it: {message}"
+                );
+            }
         }
     }
-    if let Ok(dir) = std::env::var("SHEEP_STATE_DIR") {
-        if !dir.is_empty() {
-            return Ok(PathBuf::from(dir));
-        }
+
+    #[test]
+    fn a_worktree_id_separates_two_checkouts_with_the_same_name() {
+        // Two `fix/` branches checked out side by side is the ordinary shape of
+        // a worktree-per-agent session, and the directory name alone does not
+        // tell them apart.
+        assert_ne!(
+            super::worktree_id(std::path::Path::new("/a/fix")),
+            super::worktree_id(std::path::Path::new("/b/fix"))
+        );
     }
-    let base = if let Ok(xdg) = std::env::var("XDG_STATE_HOME") {
-        PathBuf::from(xdg)
-    } else {
-        let home =
-            std::env::var("HOME").context("neither HERDR_PLUGIN_STATE_DIR nor HOME is set")?;
-        PathBuf::from(home).join(".local").join("state")
-    };
-    Ok(base.join("sheep"))
 }
