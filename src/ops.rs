@@ -111,6 +111,36 @@ pub fn plan(
     Ok(Planned { shadow, store, commit, plan })
 }
 
+/// The working tree moved between the moment a plan was made and the moment it
+/// was going to be applied.
+///
+/// This is the whole reason [`restore_expecting`] exists. A user reads a plan
+/// that says three files, and while they are reading it the agent keeps
+/// working; applying a freshly computed plan at that point would write nine.
+/// The plan a user saw has to be the plan that runs, so a moved tree stops the
+/// restore and hands back what the truth is now.
+#[derive(Debug)]
+pub struct StaleTree {
+    pub expected: String,
+    pub actual: String,
+    /// The plan as it stands now, so a caller can show it instead of recomputing.
+    pub plan: RestorePlan,
+}
+
+impl std::fmt::Display for StaleTree {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the working tree changed since this plan was made ({} is now {}); nothing was restored",
+            &self.expected[..12.min(self.expected.len())],
+            &self.actual[..12.min(self.actual.len())]
+        )
+    }
+}
+
+impl std::error::Error for StaleTree {}
+
+#[derive(Debug)]
 pub struct Restored {
     pub plan: RestorePlan,
     pub commit: String,
@@ -126,7 +156,38 @@ pub fn restore(
     target: &str,
     max_files: usize,
 ) -> Result<Restored> {
+    restore_expecting(wt, state, line, target, max_files, None)
+}
+
+/// Restore, refusing if the working tree is no longer what `expect_tree` says.
+///
+/// A caller that showed a plan to a human passes the tree that plan was
+/// computed against. The plan is then recomputed here — under the same guards,
+/// immediately before anything is written — and if the tree moved, the restore
+/// is abandoned with a [`StaleTree`] carrying the current plan. The check lives
+/// inside the operation rather than in the caller so that the verified plan and
+/// the applied plan are the same object, with no window between them.
+pub fn restore_expecting(
+    wt: &Worktree,
+    state: &Path,
+    line: &str,
+    target: &str,
+    max_files: usize,
+    expect_tree: Option<&str>,
+) -> Result<Restored> {
     let Planned { shadow, commit, plan, .. } = plan(wt, state, line, target, max_files)?;
+
+    if let Some(expected) = expect_tree {
+        if plan.current_tree != expected {
+            return Err(StaleTree {
+                expected: expected.to_string(),
+                actual: plan.current_tree.clone(),
+                plan,
+            }
+            .into());
+        }
+    }
+
     if plan.is_noop() {
         return Ok(Restored { plan, commit, checkpoint: None });
     }

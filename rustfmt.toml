@@ -1,0 +1,5 @@
+# The tree is written at 100 columns with expressions kept on one line where
+# they fit; the defaults would reflow every file in the repository. Pinned here
+# so `cargo fmt --check` in CI agrees with what is already committed.
+max_width = 100
+use_small_heuristics = "Max"

@@ -663,3 +663,57 @@ fn a_herdr_pane_id_can_name_a_timeline() {
     .unwrap();
     assert_eq!(other.seq, 1, "a different timeline must start its own numbering");
 }
+
+#[test]
+fn a_restore_refuses_a_plan_the_tree_has_moved_out_from_under() {
+    // A user reads a plan that says one file. While they read it, the agent
+    // keeps working. Applying a freshly computed plan at that point would write
+    // whatever is true *now*, not what they agreed to — so the plan a user saw
+    // has to be the plan that runs, or none at all.
+    let f = Fixture::new();
+    f.write("a.txt", "one\n");
+    f.commit_all("base");
+    let target = f.snap("turn 1");
+    f.write("a.txt", "two\n");
+    f.snap("turn 2");
+
+    let seen = ops::plan(&f.wt(), &f.state, "default", &target.to_string(), BUDGET).unwrap();
+    let tree_when_the_user_looked = seen.plan.current_tree.clone();
+    assert_eq!(seen.plan.write, vec!["a.txt".to_string()]);
+
+    // The agent keeps going while the plan is on screen.
+    f.write("b.txt", "the agent kept working\n");
+
+    let err = ops::restore_expecting(
+        &f.wt(),
+        &f.state,
+        "default",
+        &target.to_string(),
+        BUDGET,
+        Some(&tree_when_the_user_looked),
+    )
+    .expect_err("a moved tree must stop the restore");
+
+    let stale = err.downcast_ref::<ops::StaleTree>().expect("the caller needs to know why");
+    assert!(
+        stale.plan.remove.contains(&"b.txt".to_string()),
+        "the refusal should carry the plan as it stands now: {:?}",
+        stale.plan
+    );
+    assert_eq!(f.read("a.txt"), "two\n", "nothing may be written by a refused restore");
+    assert!(f.exists("b.txt"), "the agent's newer work must be left alone");
+
+    // And the same call succeeds once it is told the truth.
+    let fresh = ops::plan(&f.wt(), &f.state, "default", &target.to_string(), BUDGET).unwrap();
+    ops::restore_expecting(
+        &f.wt(),
+        &f.state,
+        "default",
+        &target.to_string(),
+        BUDGET,
+        Some(&fresh.plan.current_tree),
+    )
+    .expect("a plan that matches the tree must apply");
+    assert_eq!(f.read("a.txt"), "one\n");
+    assert!(!f.exists("b.txt"));
+}
