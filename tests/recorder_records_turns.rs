@@ -12,7 +12,7 @@
 use serde_json::json;
 use sheep::herdr::detect::{Sighting, Status, Tuning};
 use sheep::herdr::log::Log;
-use sheep::herdr::recorder::{Config, LineBy, Pump, Recorder, Source};
+use sheep::herdr::recorder::{Config, Ended, LineBy, Pump, Recorder, Source};
 use sheep::herdr::session::{Processes, Session};
 use sheep::herdr::wire::Event;
 use sheep::repo::Worktree;
@@ -24,6 +24,9 @@ use std::time::Duration;
 use tempfile::TempDir;
 
 const SETTLE_MS: u64 = 120;
+/// Short, so the tests that exercise giving up do not take a minute each.
+const PATIENCE_MS: u64 = 500;
+const RECONCILE_MS: u64 = 40;
 const BUDGET: usize = 60_000;
 
 // ---------------------------------------------------------------- fixtures --
@@ -78,9 +81,20 @@ impl Ground {
         path
     }
 
+    /// Everything on the timeline, baseline included.
     fn turns(&self, repo: &Path, line: &str) -> Vec<Turn> {
         let id = Worktree::discover(repo).expect("worktree").id;
         Store::open(&self.state, &id, line).unwrap().all().unwrap()
+    }
+
+    /// Only what the recorder claims an agent actually finished.
+    fn recorded(&self, repo: &Path, line: &str) -> Vec<Turn> {
+        self.turns(repo, line).into_iter().filter(|t| t.kind == TurnKind::Turn).collect()
+    }
+
+    /// The baseline a timeline gets before its first turn, if it has one.
+    fn baseline(&self, repo: &Path, line: &str) -> Option<Turn> {
+        self.turns(repo, line).into_iter().find(|t| t.kind == TurnKind::Checkpoint)
     }
 }
 
@@ -96,6 +110,13 @@ struct Facts {
     screens: HashMap<String, String>,
     reported: Vec<(String, u64)>,
     missing: Vec<String>,
+    /// Whether `processes` should fail with a server error that is *not* a
+    /// not-found. Herdr answers `invalid_request` for a method it does not
+    /// have and for bad params, and neither may read as "the pane is gone".
+    broken_processes: bool,
+    /// Panes that have vanished from `agent.list` without an event saying so —
+    /// what a reconnect gap looks like.
+    unlisted: Vec<String>,
 }
 
 #[derive(Clone, Default)]
@@ -131,6 +152,27 @@ impl Herdr {
         self
     }
 
+    fn break_processes(&self, broken: bool) {
+        self.0.lock().unwrap().broken_processes = broken;
+    }
+
+    fn pane_status(&self, pane_id: &str, status: Status) {
+        if let Some(pane) = self.0.lock().unwrap().panes.get_mut(pane_id) {
+            pane.status = status;
+            pane.revision += 1;
+        }
+    }
+
+    fn relist(&self, pane_id: &str) {
+        self.0.lock().unwrap().unlisted.retain(|p| p != pane_id);
+    }
+
+    /// Drop a pane out of `agent.list` while leaving it answerable, the way a
+    /// released agent looks to a recorder that missed the event.
+    fn unlist(&self, pane_id: &str) {
+        self.0.lock().unwrap().unlisted.push(pane_id.to_string());
+    }
+
     fn reported(&self) -> Vec<(String, u64)> {
         self.0.lock().unwrap().reported.clone()
     }
@@ -138,7 +180,8 @@ impl Herdr {
 
 impl Session for Herdr {
     fn agents(&self) -> anyhow::Result<Vec<Sighting>> {
-        Ok(self.0.lock().unwrap().panes.values().cloned().collect())
+        let facts = self.0.lock().unwrap();
+        Ok(facts.panes.values().filter(|s| !facts.unlisted.contains(&s.pane_id)).cloned().collect())
     }
 
     fn pane(&self, pane_id: &str) -> anyhow::Result<Option<Sighting>> {
@@ -151,6 +194,12 @@ impl Session for Herdr {
 
     fn processes(&self, pane_id: &str) -> anyhow::Result<Option<Processes>> {
         let mut facts = self.0.lock().unwrap();
+        if facts.broken_processes {
+            anyhow::bail!("herdr api invalid_request: unknown variant `pane.process_info`");
+        }
+        if facts.missing.iter().any(|p| p == pane_id) {
+            return Ok(None);
+        }
         let Some(queue) = facts.processes.get_mut(pane_id) else { return Ok(None) };
         if queue.len() > 1 {
             Ok(queue.pop_front())
@@ -177,6 +226,15 @@ fn agent_running(extra: &[u32]) -> Processes {
     Processes { shell_pid: 4_000, leader: 4_100, running }
 }
 
+/// The same agent after a restart: a new leader pid under the same shell.
+fn restarted_agent() -> Processes {
+    Processes {
+        shell_pid: 4_000,
+        leader: 5_100,
+        running: vec![(5_100, "claude.exe".to_string()), (5_200, "node".to_string())],
+    }
+}
+
 /// The pane has dropped back to its shell: whatever herdr last said about the
 /// agent describes a program that has exited.
 fn shell_only() -> Processes {
@@ -189,8 +247,10 @@ enum Step {
     Ev(Event),
     /// Let real time pass so a settle window can close.
     Rest(u64),
-    /// Change the working tree between turns.
+    /// Change the working tree, or the scripted session, between turns.
     Do(Box<dyn Fn() + Send>),
+    /// The subscription itself failed.
+    Fail(String),
 }
 
 struct Script(VecDeque<Step>);
@@ -213,6 +273,7 @@ impl Source for Script {
                 action();
                 Pump::Idle
             }
+            Some(Step::Fail(why)) => Pump::Failed(why),
             None => Pump::Closed,
         }
     }
@@ -258,7 +319,7 @@ fn config(state: &Path, dry_run: bool) -> Config {
         dry_run,
         tuning: Tuning {
             settle: Duration::from_millis(SETTLE_MS),
-            patience: Duration::from_secs(5),
+            patience: Duration::from_millis(PATIENCE_MS),
         },
         line_by: LineBy::Agent,
         file_budget: BUDGET,
@@ -270,8 +331,13 @@ fn config(state: &Path, dry_run: bool) -> Config {
 
 fn run(herdr: &Herdr, state: &Path, dry_run: bool, steps: Vec<Step>) -> Recorder<Herdr> {
     let mut recorder = Recorder::new(herdr.clone(), config(state, dry_run), Log::to_stdout());
-    recorder.pump(&mut Script::new(steps));
+    let _ = recorder.pump(&mut Script::new(steps));
     recorder
+}
+
+fn tweak(herdr: &Herdr, change: impl Fn(&Herdr) + Send + 'static) -> Step {
+    let handle = herdr.clone();
+    Step::Do(Box::new(move || change(&handle)))
 }
 
 // ------------------------------------------------------------------- tests --
@@ -288,14 +354,28 @@ fn a_finished_turn_is_recorded_against_its_pane_and_agent() {
 
     run(&herdr, &ground.state, false, one_turn("w1:p1", "claude", &repo, 10, "fn main() { }\n"));
 
-    let turns = ground.turns(&repo, "claude");
+    let baseline =
+        ground.baseline(&repo, "claude").expect("a timeline needs something to rewind to");
+    assert_eq!(baseline.note.as_deref(), Some("baseline, before the first recorded turn"));
+
+    let turns = ground.recorded(&repo, "claude");
     assert_eq!(turns.len(), 1, "one finished turn, one entry: {turns:?}");
     let turn = &turns[0];
     assert_eq!(turn.kind, TurnKind::Turn);
+    assert_eq!(
+        turn.parent.as_deref(),
+        Some(baseline.commit.as_str()),
+        "measured against the baseline"
+    );
+    assert_eq!(turn.insertions, 1, "and the diffstat is real, not the whole tree");
     assert_eq!(turn.agent.as_deref(), Some("claude"));
     assert_eq!(turn.pane_id.as_deref(), Some("w1:p1"));
     assert_eq!(turn.prompt.as_deref(), Some("tidy up the parser"));
-    assert_eq!(herdr.reported(), vec![("w1:p1".to_string(), 1)], "herdr is told the turn number");
+    assert_eq!(
+        herdr.reported(),
+        vec![("w1:p1".to_string(), turn.seq)],
+        "herdr is told the turn number"
+    );
 }
 
 #[test]
@@ -313,7 +393,7 @@ fn herdr_changing_its_mind_stops_the_turn_being_recorded() {
 
     run(&herdr, &ground.state, false, one_turn("w1:p1", "claude", &repo, 10, "fn main() { }\n"));
 
-    assert!(ground.turns(&repo, "claude").is_empty(), "a done herdr took back is not a turn");
+    assert!(ground.recorded(&repo, "claude").is_empty(), "a done herdr took back is not a turn");
     assert!(herdr.reported().is_empty());
 }
 
@@ -341,7 +421,7 @@ fn a_pane_still_spawning_processes_is_not_finished() {
 
     run(&herdr, &ground.state, false, steps);
 
-    let turns = ground.turns(&repo, "claude");
+    let turns = ground.recorded(&repo, "claude");
     assert_eq!(turns.len(), 1, "the turn lands once the process group settles: {turns:?}");
 }
 
@@ -358,7 +438,7 @@ fn a_pane_whose_agent_has_exited_records_nothing() {
     run(&herdr, &ground.state, false, one_turn("w1:p1", "claude", &repo, 10, "fn main() { }\n"));
 
     assert!(
-        ground.turns(&repo, "claude").is_empty(),
+        ground.recorded(&repo, "claude").is_empty(),
         "a pane back at its shell has no agent to have finished a turn"
     );
 }
@@ -407,14 +487,24 @@ fn four_agents_in_four_worktrees_get_four_timelines() {
     assert_eq!(recorder.recorded(), 4);
 
     for repo in &repos {
-        let turns = ground.turns(repo, "claude");
+        let turns = ground.recorded(repo, "claude");
         assert_eq!(turns.len(), 1, "{} should hold exactly its own turn", repo.display());
-        assert_eq!(turns[0].seq, 1, "each timeline numbers from one");
+        assert_eq!(turns[0].seq, 2, "after the baseline this timeline holds one turn");
     }
 
+    // Each pane must be told *its own* number. Counting four reports would pass
+    // just as well if all four named the same pane.
     let mut reported = herdr.reported();
     reported.sort();
-    assert_eq!(reported.len(), 4, "each pane is told its own turn number: {reported:?}");
+    assert_eq!(
+        reported,
+        vec![
+            ("w1:p1".to_string(), 2),
+            ("w1:p2".to_string(), 2),
+            ("w1:p3".to_string(), 2),
+            ("w1:p4".to_string(), 2),
+        ]
+    );
 }
 
 #[test]
@@ -442,7 +532,7 @@ fn one_unrecordable_worktree_does_not_stop_the_others() {
     let recorder = run(&herdr, &ground.state, false, steps);
 
     assert!(ground.turns(&stuck, "claude").is_empty(), "the stuck worktree records nothing");
-    assert_eq!(ground.turns(&good, "codex").len(), 1, "and the healthy one is unaffected");
+    assert_eq!(ground.recorded(&good, "codex").len(), 1, "and the healthy one is unaffected");
     assert_eq!(recorder.recorded(), 1);
 }
 
@@ -485,7 +575,7 @@ fn a_turn_that_changed_nothing_does_not_reach_the_timeline() {
 
     run(&herdr, &ground.state, false, steps);
 
-    let turns = ground.turns(&repo, "claude");
+    let turns = ground.recorded(&repo, "claude");
     assert_eq!(turns.len(), 1, "an answer with no edit is not a checkpoint worth keeping");
 }
 
@@ -496,9 +586,7 @@ fn a_pane_that_appears_after_start_up_is_picked_up() {
     // Deliberately not in `agents()`: the recorder only learns about this pane
     // from the stream, the way a pane split at lunchtime arrives.
     let herdr = Herdr::default();
-    herdr
-        .processes("w9:p9", vec![agent_running(&[])])
-        .screen("w9:p9", "❯ start something new\n");
+    herdr.processes("w9:p9", vec![agent_running(&[])]).screen("w9:p9", "❯ start something new\n");
     herdr.pane("w9:p9", "claude", &repo, Status::Idle);
     herdr.0.lock().unwrap().panes.clear();
 
@@ -517,7 +605,7 @@ fn a_pane_that_appears_after_start_up_is_picked_up() {
     herdr.pane("w9:p9", "claude", &repo, Status::Idle);
 
     run(&herdr, &ground.state, false, steps);
-    assert_eq!(ground.turns(&repo, "claude").len(), 1);
+    assert_eq!(ground.recorded(&repo, "claude").len(), 1);
 }
 
 #[test]
@@ -533,7 +621,10 @@ fn a_pane_that_closed_mid_window_records_nothing() {
 
     run(&herdr, &ground.state, false, one_turn("w1:p1", "claude", &repo, 10, "fn main() { }\n"));
 
-    assert!(ground.turns(&repo, "claude").is_empty(), "a pane that is gone cannot finish a turn");
+    assert!(
+        ground.recorded(&repo, "claude").is_empty(),
+        "a pane that is gone cannot finish a turn"
+    );
 }
 
 #[test]
@@ -554,8 +645,305 @@ fn timelines_can_be_named_by_pane_instead() {
     recorder.pump(&mut Script::new(one_turn("w1:p1", "claude", &repo, 10, "fn main() { }\n")));
 
     assert!(ground.turns(&repo, "claude").is_empty());
-    // A pane id has a colon in it, and a colon is legal in neither a file name
-    // nor a git ref; the timeline name is cleaned before either sees it.
-    assert_eq!(ground.turns(&repo, "w1-p1").len(), 1);
-    assert_eq!(ground.turns(&repo, "w1:p1").len(), 1, "and `Store` cleans it the same way");
+    // The raw pane id is the timeline name. `store::slug` is what makes it safe
+    // as a file name and a git ref, and both the turn log and the shadow
+    // repository go through it — the recorder must not clean it a second time
+    // and disagree with them about which timeline this pane owns.
+    assert_eq!(ground.recorded(&repo, "w1:p1").len(), 1);
+}
+
+// ------------------------------------------- the ways a turn can be invented --
+
+#[test]
+fn a_pane_that_moves_mid_window_files_nothing_anywhere() {
+    // Herdr re-sends a pane when it changes directory, and the settle window is
+    // ten seconds wide by default. Reading the pane's *current* directory when
+    // the window closes snapshots whatever repository it has wandered into —
+    // filing a turn against a tree nobody touched, while the one the agent
+    // actually edited records nothing at all.
+    let ground = Ground::new();
+    let worked_in = ground.repo("worked-in");
+    let wandered_to = ground.repo("wandered-to");
+    let herdr = Herdr::default();
+    herdr
+        .pane("w1:p1", "claude", &worked_in, Status::Idle)
+        .processes("w1:p1", vec![agent_running(&[4_200])])
+        .screen("w1:p1", "❯ edit the parser\n");
+
+    let steps = vec![
+        status("w1:p1", "claude", &worked_in, "working", 10),
+        edit(worked_in.join("src.rs"), "fn main() { /* real work */ }\n"),
+        status("w1:p1", "claude", &worked_in, "idle", 11),
+        // The pane moves before the window closes.
+        status("w1:p1", "claude", &wandered_to, "idle", 12),
+        Step::Rest(SETTLE_MS * 3),
+    ];
+    let recorder = run(&herdr, &ground.state, false, steps);
+
+    assert!(
+        ground.recorded(&wandered_to, "claude").is_empty(),
+        "nothing may be filed against a repository the agent never touched"
+    );
+    assert!(
+        ground.recorded(&worked_in, "claude").is_empty(),
+        "and a boundary we can no longer vouch for is withdrawn, not guessed at"
+    );
+    assert_eq!(recorder.recorded(), 0);
+    assert!(herdr.reported().is_empty());
+}
+
+#[test]
+fn a_move_the_stream_missed_is_still_caught_when_herdr_is_asked() {
+    // The detector withdraws candidates for moves it saw. A reconnect loses
+    // events, so the corroboration asks outright as well.
+    let ground = Ground::new();
+    let worked_in = ground.repo("worked-in");
+    let wandered_to = ground.repo("wandered-to");
+    let herdr = Herdr::default();
+    // What herdr answers when asked directly: the pane has already moved.
+    herdr
+        .pane("w1:p1", "claude", &wandered_to, Status::Idle)
+        .processes("w1:p1", vec![agent_running(&[4_200])])
+        .screen("w1:p1", "❯ edit the parser\n");
+
+    // What the stream says: the whole turn happened in the other repository.
+    run(&herdr, &ground.state, false, one_turn("w1:p1", "claude", &worked_in, 10, "fn x() {}\n"));
+
+    assert!(ground.recorded(&wandered_to, "claude").is_empty());
+    assert!(ground.recorded(&worked_in, "claude").is_empty());
+}
+
+#[test]
+fn a_boundary_with_no_change_leaves_a_baseline_and_no_turn() {
+    // `ops::snap` can only tell that nothing changed by comparing against the
+    // previous turn, so on an empty timeline the first boundary would always
+    // record — `1 file(s) +0 -0` — whether or not anything happened. That is
+    // the mechanism by which a phantom boundary becomes a turn on disk.
+    let ground = Ground::new();
+    let repo = ground.repo("work");
+    let herdr = Herdr::default();
+    herdr
+        .pane("w1:p1", "claude", &repo, Status::Idle)
+        .processes("w1:p1", vec![agent_running(&[4_200])])
+        .screen("w1:p1", "❯ what does this file do\n");
+
+    // A whole turn that touches nothing.
+    let steps = vec![
+        status("w1:p1", "claude", &repo, "working", 10),
+        status("w1:p1", "claude", &repo, "idle", 11),
+        Step::Rest(SETTLE_MS * 2),
+    ];
+    let recorder = run(&herdr, &ground.state, false, steps);
+
+    assert!(
+        ground.recorded(&repo, "claude").is_empty(),
+        "a turn that changed nothing is not a turn, even as the first entry"
+    );
+    let baseline =
+        ground.baseline(&repo, "claude").expect("but there is still somewhere to rewind to");
+    assert_eq!(baseline.kind, TurnKind::Checkpoint);
+    assert_eq!(baseline.seq, 1);
+    assert_eq!(recorder.recorded(), 0);
+    assert!(herdr.reported().is_empty(), "and herdr is not told about a turn that did not happen");
+}
+
+#[test]
+fn a_server_error_makes_the_recorder_wait_and_then_give_up() {
+    // `invalid_request` — a herdr without the method, or a params mistake — is
+    // not "there is no pane", so the boundary is held rather than dropped. But
+    // holding it cannot be for ever: each retry costs two blocking requests, so
+    // a candidate that can never be corroborated has to be given up on inside
+    // `patience` instead of wedging the loop while every other pane goes
+    // unrecorded.
+    let ground = Ground::new();
+    let repo = ground.repo("work");
+    let herdr = Herdr::default();
+    herdr
+        .pane("w1:p1", "claude", &repo, Status::Idle)
+        .processes("w1:p1", vec![agent_running(&[4_200])])
+        .screen("w1:p1", "❯ first\n");
+
+    let mut steps = vec![tweak(&herdr, |h| h.break_processes(true))];
+    steps.extend(one_turn("w1:p1", "claude", &repo, 10, "fn main() { /* one */ }\n"));
+    steps.push(Step::Rest(PATIENCE_MS * 2));
+    // Herdr recovers, and the pane is still sitting at rest. The turn that was
+    // given up on must stay given up on: it was never corroborated.
+    steps.push(tweak(&herdr, |h| h.break_processes(false)));
+    steps.push(status("w1:p1", "claude", &repo, "idle", 12));
+    steps.push(Step::Rest(SETTLE_MS * 3));
+
+    let recorder = run(&herdr, &ground.state, false, steps);
+
+    assert!(
+        ground.recorded(&repo, "claude").is_empty(),
+        "an uncorroborated boundary does not become a turn once the server feels better"
+    );
+    assert_eq!(recorder.recorded(), 0);
+}
+
+#[test]
+fn a_server_error_does_not_stop_the_recorder_recording() {
+    // The other half: refusing one turn must not be the end of recording. A
+    // herdr whose `pane.process_info` fails once has to leave the next turn
+    // recordable.
+    let ground = Ground::new();
+    let repo = ground.repo("work");
+    let herdr = Herdr::default();
+    herdr
+        .pane("w1:p1", "claude", &repo, Status::Idle)
+        .processes("w1:p1", vec![agent_running(&[4_200])])
+        .screen("w1:p1", "❯ first\n");
+
+    let mut steps = vec![tweak(&herdr, |h| h.break_processes(true))];
+    steps.extend(one_turn("w1:p1", "claude", &repo, 10, "fn main() { /* one */ }\n"));
+    steps.push(Step::Rest(PATIENCE_MS * 2));
+    steps.push(tweak(&herdr, |h| h.break_processes(false)));
+    steps.extend(one_turn("w1:p1", "claude", &repo, 20, "fn main() { /* two */ }\n"));
+    steps.push(Step::Rest(SETTLE_MS * 2));
+
+    let recorder = run(&herdr, &ground.state, false, steps);
+
+    let turns = ground.recorded(&repo, "claude");
+    assert_eq!(turns.len(), 1, "the healthy turn still lands: {turns:?}");
+    assert_eq!(recorder.recorded(), 1);
+}
+
+#[test]
+fn each_turn_is_corroborated_against_its_own_process_group() {
+    // A fingerprint is only meaningful for the candidate that took it. Leaving
+    // turn N's process group in the map means turn N+1 is measured against it,
+    // and a changed leader between two turns then throws away a real turn.
+    let ground = Ground::new();
+    let repo = ground.repo("work");
+    let herdr = Herdr::default();
+    herdr
+        .pane("w1:p1", "claude", &repo, Status::Idle)
+        .processes("w1:p1", vec![agent_running(&[4_200])])
+        .screen("w1:p1", "❯ first\n");
+
+    let mut steps = one_turn("w1:p1", "claude", &repo, 10, "fn main() { /* one */ }\n");
+    // The agent restarts: a new leader pid, and the fingerprint read for the
+    // second candidate fails, so there is nothing legitimate to compare to.
+    steps.push(tweak(&herdr, |h| {
+        h.processes("w1:p1", vec![restarted_agent()]);
+        h.break_processes(true);
+    }));
+    steps.push(status("w1:p1", "claude", &repo, "working", 20));
+    steps.push(edit(repo.join("src.rs"), "fn main() { /* two */ }\n"));
+    steps.push(status("w1:p1", "claude", &repo, "idle", 21));
+    steps.push(tweak(&herdr, |h| h.break_processes(false)));
+    steps.push(Step::Rest(SETTLE_MS * 3));
+
+    run(&herdr, &ground.state, false, steps);
+
+    let turns = ground.recorded(&repo, "claude");
+    assert_eq!(
+        turns.len(),
+        2,
+        "the second turn must not be judged against the first one's processes: {turns:?}"
+    );
+}
+
+// ------------------------------------------- the ways it can stop recording --
+
+#[test]
+fn reconcile_forgets_a_pane_that_dropped_off_the_agent_list() {
+    // `pane.closed`, `pane.exited` and agent-released are exactly the events a
+    // reconnect loses. Without pruning, a pane's `worked` flag stays true for
+    // the rest of the day and the next time it looks idle it files a turn for
+    // work nobody can vouch for.
+    let ground = Ground::new();
+    let repo = ground.repo("work");
+    let herdr = Herdr::default();
+    herdr
+        .pane("w1:p1", "claude", &repo, Status::Working)
+        .processes("w1:p1", vec![agent_running(&[4_200])])
+        .screen("w1:p1", "❯ do the thing\n");
+
+    let steps = vec![
+        // The agent goes away without an event saying so.
+        tweak(&herdr, |h| {
+            h.unlist("w1:p1");
+        }),
+        Step::Rest(RECONCILE_MS * 3),
+        // ...and comes back looking idle, having done nothing we witnessed.
+        tweak(&herdr, |h| {
+            h.relist("w1:p1");
+            h.pane_status("w1:p1", Status::Idle);
+        }),
+        edit(repo.join("src.rs"), "fn main() { /* whoever did this */ }\n"),
+        status("w1:p1", "claude", &repo, "idle", 30),
+        Step::Rest(SETTLE_MS * 3),
+    ];
+
+    let mut recorder = Recorder::new(
+        herdr.clone(),
+        Config {
+            reconcile_every: Duration::from_millis(RECONCILE_MS),
+            ..config(&ground.state, false)
+        },
+        Log::to_stdout(),
+    );
+    let _ = recorder.pump(&mut Script::new(steps));
+
+    assert!(
+        ground.recorded(&repo, "claude").is_empty(),
+        "a pane herdr stopped listing is not evidence of a finished turn"
+    );
+}
+
+#[test]
+fn reconcile_picks_up_a_turn_the_stream_never_mentioned() {
+    // The other direction: everything about this turn arrives through
+    // `agent.list`, the way it does after a reconnect swallowed the events.
+    let ground = Ground::new();
+    let repo = ground.repo("work");
+    let herdr = Herdr::default();
+    herdr
+        .pane("w1:p1", "claude", &repo, Status::Idle)
+        .processes("w1:p1", vec![agent_running(&[4_200])])
+        .screen("w1:p1", "❯ quietly\n");
+
+    let steps = vec![
+        tweak(&herdr, |h| h.pane_status("w1:p1", Status::Working)),
+        Step::Rest(RECONCILE_MS * 3),
+        edit(repo.join("src.rs"), "fn main() { /* done offstage */ }\n"),
+        tweak(&herdr, |h| h.pane_status("w1:p1", Status::Idle)),
+        Step::Rest(RECONCILE_MS * 3),
+        Step::Rest(SETTLE_MS * 3),
+    ];
+
+    let mut recorder = Recorder::new(
+        herdr.clone(),
+        Config {
+            reconcile_every: Duration::from_millis(RECONCILE_MS),
+            ..config(&ground.state, false)
+        },
+        Log::to_stdout(),
+    );
+    let _ = recorder.pump(&mut Script::new(steps));
+
+    assert_eq!(
+        ground.recorded(&repo, "claude").len(),
+        1,
+        "a re-sync has to be able to see a whole turn on its own"
+    );
+}
+
+#[test]
+fn the_pump_says_how_the_stream_ended() {
+    let ground = Ground::new();
+    let herdr = Herdr::default();
+
+    let mut recorder = Recorder::new(herdr.clone(), config(&ground.state, false), Log::to_stdout());
+    assert!(
+        matches!(recorder.pump(&mut Script::new(vec![])), Ended::Disconnected),
+        "an exhausted stream is a disconnection, which the supervisor retries"
+    );
+
+    let ended = recorder.pump(&mut Script::new(vec![Step::Fail("herdr ended it".into())]));
+    match ended {
+        Ended::Failed(why) => assert!(why.contains("herdr ended it"), "the reason survives: {why}"),
+        other => panic!("expected a reported failure, got {other:?}"),
+    }
 }

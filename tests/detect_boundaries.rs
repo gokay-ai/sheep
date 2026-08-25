@@ -39,6 +39,17 @@ fn withdrawn(signals: &[Signal]) -> Option<Withdrawn> {
     })
 }
 
+fn seen_in(pane: &str, cwd: &str, status: Status, revision: u64) -> Sighting {
+    Sighting { cwd: Some(cwd.to_string()), ..seen(pane, status, revision) }
+}
+
+fn ripe_cwd(signals: &[Signal]) -> Option<String> {
+    signals.iter().find_map(|s| match s {
+        Signal::Ripe { cwd, .. } => cwd.clone(),
+        _ => None,
+    })
+}
+
 fn ripe(signals: &[Signal]) -> Option<(String, bool)> {
     signals.iter().find_map(|s| match s {
         Signal::Ripe { pane_id, noisy, .. } => Some((pane_id.clone(), *noisy)),
@@ -213,7 +224,7 @@ fn waiting_re_arms_the_window_instead_of_dropping_the_turn() {
     assert!(ripe(&d.tick(t0 + Duration::from_secs(5))).is_some());
 
     // Corroboration disagreed — the agent is still spawning processes.
-    d.resolve(t0 + Duration::from_secs(5), "w1:p1", Verdict::Wait);
+    let _ = d.resolve(t0 + Duration::from_secs(5), "w1:p1", Verdict::Wait);
     assert!(d.is_pending("w1:p1"), "the candidate is still on the books");
     assert!(d.tick(t0 + Duration::from_secs(6)).is_empty(), "and not asked about again at once");
     assert!(ripe(&d.tick(t0 + Duration::from_secs(9))).is_some(), "it is asked about again later");
@@ -227,7 +238,7 @@ fn a_recorded_turn_clears_the_pane_until_it_works_again() {
     d.observe(t0, &seen("w1:p1", Status::Working, 10));
     d.observe(t0 + Duration::from_secs(1), &seen("w1:p1", Status::Idle, 11));
     assert!(ripe(&d.tick(t0 + Duration::from_secs(5))).is_some());
-    d.resolve(t0 + Duration::from_secs(5), "w1:p1", Verdict::Settled);
+    let _ = d.resolve(t0 + Duration::from_secs(5), "w1:p1", Verdict::Settled);
 
     // herdr often follows `idle` with `done`, or the other way round. Neither
     // is a second turn.
@@ -244,7 +255,7 @@ fn dropping_a_candidate_does_not_leave_the_pane_armed() {
     d.observe(t0, &seen("w1:p1", Status::Working, 10));
     d.observe(t0 + Duration::from_secs(1), &seen("w1:p1", Status::Idle, 11));
     assert!(ripe(&d.tick(t0 + Duration::from_secs(5))).is_some());
-    d.resolve(t0 + Duration::from_secs(5), "w1:p1", Verdict::Drop);
+    let _ = d.resolve(t0 + Duration::from_secs(5), "w1:p1", Verdict::Drop);
 
     assert!(!d.is_pending("w1:p1"));
     let after = d.observe(t0 + Duration::from_secs(6), &seen("w1:p1", Status::Done, 12));
@@ -267,7 +278,7 @@ fn the_prompt_is_held_from_the_start_of_a_turn_until_it_is_recorded() {
     assert_eq!(d.prompt("w1:p1"), Some("fix the flaky test"));
 
     d.tick(t0 + Duration::from_secs(5));
-    d.resolve(t0 + Duration::from_secs(5), "w1:p1", Verdict::Settled);
+    let _ = d.resolve(t0 + Duration::from_secs(5), "w1:p1", Verdict::Settled);
     assert_eq!(d.prompt("w1:p1"), None, "one prompt belongs to exactly one turn");
 }
 
@@ -314,4 +325,131 @@ fn a_status_string_herdr_adds_later_reads_as_unknown() {
     assert!(!Status::parse("compacting").is_rest());
     assert!(Status::parse("idle").is_rest() && Status::parse("done").is_rest());
     assert!(!Status::parse("working").is_rest() && !Status::parse("blocked").is_rest());
+}
+
+#[test]
+fn a_turn_belongs_to_the_directory_it_happened_in() {
+    // Herdr re-sends a pane when it changes directory, and the settle window is
+    // ten seconds wide. Reading the *current* directory at the far end of it
+    // files the turn against whatever repository the pane has wandered into.
+    let mut d = detector();
+    let t0 = Instant::now();
+
+    d.observe(t0, &seen_in("w1:p1", "/repo/a", Status::Working, 10));
+    let opened =
+        d.observe(t0 + Duration::from_secs(1), &seen_in("w1:p1", "/repo/a", Status::Idle, 11));
+    assert!(opened.iter().any(is_candidate));
+
+    let moved =
+        d.observe(t0 + Duration::from_secs(2), &seen_in("w1:p1", "/repo/b", Status::Idle, 12));
+    assert_eq!(
+        withdrawn(&moved),
+        Some(Withdrawn::MovedDirectory),
+        "a pane that moved is not describing the tree the turn happened in"
+    );
+    assert!(
+        d.tick(t0 + Duration::from_secs(30)).is_empty(),
+        "and nothing may be filed against either repository"
+    );
+}
+
+#[test]
+fn a_ripe_boundary_reports_where_the_work_was_done() {
+    let mut d = detector();
+    let t0 = Instant::now();
+
+    d.observe(t0, &seen_in("w1:p1", "/repo/a", Status::Working, 10));
+    d.observe(t0 + Duration::from_secs(1), &seen_in("w1:p1", "/repo/a", Status::Idle, 11));
+    // A sighting with no directory at all is not a move — herdr omits the field
+    // rather than reporting a change.
+    d.observe(
+        t0 + Duration::from_secs(2),
+        &Sighting { cwd: None, ..seen("w1:p1", Status::Idle, 12) },
+    );
+
+    let fired = d.tick(t0 + Duration::from_secs(6));
+    assert_eq!(ripe_cwd(&fired).as_deref(), Some("/repo/a"));
+}
+
+#[test]
+fn patience_bounds_the_corroboration_loop_too() {
+    // `Wait` is what the recorder answers when it cannot corroborate — which is
+    // also what it answers when herdr has stopped replying. Each retry costs two
+    // blocking requests, so an unbounded retry keeps the loop wedged on one sick
+    // pane while every other pane goes unrecorded.
+    let mut d = Detector::new(Tuning { settle: SETTLE, patience: Duration::from_secs(30) });
+    let t0 = Instant::now();
+
+    d.observe(t0, &seen("w1:p1", Status::Working, 10));
+    d.observe(t0 + Duration::from_secs(1), &seen("w1:p1", Status::Idle, 11));
+
+    let mut asked = 0;
+    let mut gave_up = None;
+    for step in 1..40 {
+        let at = t0 + Duration::from_secs(step * 3);
+        if ripe(&d.tick(at)).is_none() {
+            continue;
+        }
+        asked += 1;
+        let signals = d.resolve(at, "w1:p1", Verdict::Wait);
+        if let Some(why) = withdrawn(&signals) {
+            gave_up = Some((why, step));
+            break;
+        }
+    }
+
+    assert_eq!(
+        gave_up.map(|(why, _)| why),
+        Some(Withdrawn::Uncorroborated),
+        "after {asked} attempts the candidate should have been given up on"
+    );
+    assert!(!d.is_pending("w1:p1"), "and it must not still be on the books");
+    assert!(d.tick(t0 + Duration::from_secs(600)).is_empty());
+}
+
+#[test]
+fn giving_up_on_a_candidate_does_not_leave_the_pane_armed() {
+    let mut d = Detector::new(Tuning { settle: SETTLE, patience: Duration::from_secs(5) });
+    let t0 = Instant::now();
+
+    d.observe(t0, &seen("w1:p1", Status::Working, 10));
+    d.observe(t0 + Duration::from_secs(1), &seen("w1:p1", Status::Idle, 11));
+    assert!(ripe(&d.tick(t0 + Duration::from_secs(5))).is_some());
+
+    let signals = d.resolve(t0 + Duration::from_secs(20), "w1:p1", Verdict::Wait);
+    assert_eq!(withdrawn(&signals), Some(Withdrawn::Uncorroborated));
+
+    // The pane has to earn a new candidate by working again.
+    let after = d.observe(t0 + Duration::from_secs(21), &seen("w1:p1", Status::Done, 12));
+    assert!(after.is_empty(), "a given-up candidate must not come back: {after:?}");
+}
+
+#[test]
+fn a_turn_starting_says_where_and_who() {
+    // The recorder needs both to take a baseline on the timeline this pane is
+    // about to write to, before the agent touches anything.
+    let mut d = detector();
+    let t0 = Instant::now();
+
+    d.observe(t0, &seen_in("w1:p1", "/repo/a", Status::Idle, 10));
+    let signals =
+        d.observe(t0 + Duration::from_secs(1), &seen_in("w1:p1", "/repo/a", Status::Working, 11));
+
+    let started = signals.iter().find_map(|s| match s {
+        Signal::Started { agent, cwd, .. } => Some((agent.clone(), cwd.clone())),
+        _ => None,
+    });
+    assert_eq!(started, Some((Some("claude".to_string()), Some("/repo/a".to_string()))));
+}
+
+#[test]
+fn the_detector_can_list_what_it_is_holding() {
+    let mut d = detector();
+    let t0 = Instant::now();
+    for pane in ["w1:p1", "w1:p2"] {
+        d.observe(t0, &seen(pane, Status::Working, 10));
+    }
+    let mut ids = d.pane_ids();
+    ids.sort();
+    assert_eq!(ids, vec!["w1:p1".to_string(), "w1:p2".to_string()]);
 }

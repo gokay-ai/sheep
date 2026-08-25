@@ -76,17 +76,36 @@ pub trait Session {
     fn report_turn(&self, pane_id: &str, seq: u64, ttl: Duration) -> Result<()>;
 }
 
+/// Error codes that genuinely mean "the thing you asked about is not there".
+///
+/// Verified against herdr 0.8.0 (protocol 19) by asking about a pane that does
+/// not exist: `pane.get`, `pane.process_info`, `pane.read` and
+/// `pane.report_metadata` all answer `pane_not_found`, and `agent.get` answers
+/// `agent_not_found`.
+///
+/// Nothing else may be read as absence. A herdr build without a method, a
+/// params mistake and a transient internal failure all arrive as an
+/// `ApiError` too — `invalid_request` in the first two cases — and swallowing
+/// those as "the pane is gone" is how a recorder stops recording for the rest
+/// of the day while its log still says everything is fine.
+const NOT_FOUND: [&str; 2] = ["pane_not_found", "agent_not_found"];
+
 /// The live session on `$HERDR_SOCKET_PATH`.
 pub struct Live;
 
 impl Live {
-    /// `None` rather than an error when herdr says the pane does not exist —
-    /// panes close while the recorder is mid-question, and that is not a fault.
+    /// `None` when herdr says the thing does not exist; the error otherwise.
+    ///
+    /// Panes close while the recorder is mid-question, and that is not a
+    /// fault. Every other failure is one, and has to reach the caller so it
+    /// can wait and say so rather than quietly deciding there was no turn.
     fn optional(result: Result<Value>) -> Result<Option<Value>> {
         match result {
             Ok(value) => Ok(Some(value)),
-            Err(err) if err.downcast_ref::<wire::ApiError>().is_some() => Ok(None),
-            Err(err) => Err(err),
+            Err(err) => match err.downcast_ref::<wire::ApiError>() {
+                Some(api) if NOT_FOUND.contains(&api.code.as_str()) => Ok(None),
+                _ => Err(err),
+            },
         }
     }
 }

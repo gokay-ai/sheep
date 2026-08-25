@@ -26,8 +26,14 @@
 //!    false-`done` case, and withdrawing is the whole defence against it.
 //! 4. `blocked` and `unknown` withdraw it too — an agent waiting on the user has
 //!    not finished a turn, and `unknown` means herdr has lost the thread.
-//! 5. When the window finally elapses the recorder gets [`Signal::Ripe`] and
-//!    corroborates against the live session before anything is written.
+//! 5. The candidate remembers the working directory it opened in. If the pane
+//!    moves before the window closes, the candidate is withdrawn rather than
+//!    filed against a repository the agent never touched.
+//! 6. When the window finally elapses the recorder gets [`Signal::Ripe`] and
+//!    corroborates against the live session before anything is written. The
+//!    corroboration can ask to wait, but only until `patience` runs out: a
+//!    candidate that can never be corroborated is given up on, not retried for
+//!    the rest of the day.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -91,6 +97,11 @@ pub enum Withdrawn {
     LostAgent,
     /// The pane closed, exited, or released its agent.
     PaneGone,
+    /// The pane's working directory changed while the candidate was open, so
+    /// the tree we would snapshot is no longer the tree the agent worked in.
+    MovedDirectory,
+    /// The recorder could not corroborate the boundary within `patience`.
+    Uncorroborated,
 }
 
 impl Withdrawn {
@@ -100,6 +111,10 @@ impl Withdrawn {
             Withdrawn::Blocked => "the agent is blocked on the user",
             Withdrawn::LostAgent => "herdr lost track of the agent",
             Withdrawn::PaneGone => "the pane is gone",
+            Withdrawn::MovedDirectory => {
+                "the pane changed directory — the work was done somewhere else"
+            }
+            Withdrawn::Uncorroborated => "it could not be corroborated within patience",
         }
     }
 }
@@ -107,13 +122,19 @@ impl Withdrawn {
 /// Something the recorder has to act on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Signal {
-    /// A turn just started here. Best-effort prompt capture happens now, while
-    /// what the user typed is still the freshest thing on the screen.
-    Started { pane_id: String },
+    /// A turn just started here. Two things happen on this edge: the prompt is
+    /// scraped while what the user typed is still the freshest thing on the
+    /// screen, and the timeline gets a baseline if it does not have one — the
+    /// tree *before* the agent touches anything is what a first turn has to be
+    /// measured against.
+    Started { pane_id: String, agent: Option<String>, cwd: Option<String> },
     /// A boundary is being considered. The recorder fingerprints the pane's
     /// processes now, so it can tell at [`Signal::Ripe`] whether anything moved.
     Candidate { pane_id: String },
     /// The quiet window elapsed. Corroborate, then record.
+    ///
+    /// `agent` and `cwd` are the ones the candidate opened with, not whatever
+    /// the pane says now. A turn belongs to the directory the work happened in.
     Ripe {
         pane_id: String,
         agent: Option<String>,
@@ -155,9 +176,18 @@ impl Default for Tuning {
 
 #[derive(Debug)]
 struct Candidate {
+    /// The agent and working directory at the moment the boundary opened.
+    ///
+    /// Herdr re-sends a pane on `cd`, so the pane's *current* directory is not
+    /// the one the turn happened in — a directory change during a ten-second
+    /// window would otherwise file the turn against a repository the agent
+    /// never touched, and leave the real one with nothing.
+    agent: Option<String>,
+    cwd: Option<String>,
     /// When the current quiet window closes.
     due: Instant,
-    /// Stop restarting the window on new output after this.
+    /// Stop restarting the window on new output after this. Also the ceiling
+    /// on the whole wait, corroboration retries included.
     deadline: Instant,
     /// False once [`Signal::Ripe`] has been emitted and we are waiting for a
     /// verdict, so the same candidate cannot fire twice.
@@ -197,6 +227,18 @@ impl Pane {
     }
 }
 
+/// Whether a pane has moved away from where a candidate opened.
+///
+/// A sighting that simply does not carry a directory is not a move: herdr omits
+/// the field rather than reporting a change, and treating silence as a move
+/// would withdraw every candidate on a pane herdr happens to be terse about.
+fn moved(opened_in: &Option<String>, now_in: &Option<String>) -> bool {
+    match (opened_in, now_in) {
+        (Some(before), Some(after)) => before != after,
+        _ => false,
+    }
+}
+
 /// The state machine. One per recorder.
 #[derive(Debug)]
 pub struct Detector {
@@ -218,7 +260,11 @@ impl Detector {
             let started = fresh.worked;
             self.panes.insert(sighting.pane_id.clone(), fresh);
             if started {
-                out.push(Signal::Started { pane_id: sighting.pane_id.clone() });
+                out.push(Signal::Started {
+                    pane_id: sighting.pane_id.clone(),
+                    agent: sighting.agent.clone(),
+                    cwd: sighting.cwd.clone(),
+                });
             }
             return out;
         };
@@ -251,7 +297,11 @@ impl Detector {
                 }
                 pane.worked = true;
                 if was != Status::Working {
-                    out.push(Signal::Started { pane_id: sighting.pane_id.clone() });
+                    out.push(Signal::Started {
+                        pane_id: sighting.pane_id.clone(),
+                        agent: pane.agent.clone(),
+                        cwd: pane.cwd.clone(),
+                    });
                 }
             }
 
@@ -279,6 +329,8 @@ impl Detector {
                 if was == Status::Working && pane.worked && pane.candidate.is_none() {
                     let deadline = now + self.tuning.patience;
                     pane.candidate = Some(Candidate {
+                        agent: pane.agent.clone(),
+                        cwd: pane.cwd.clone(),
                         // Patience is a ceiling on the whole wait, not just on
                         // how often the window may restart.
                         due: (now + self.tuning.settle).min(deadline),
@@ -288,10 +340,19 @@ impl Detector {
                     });
                     out.push(Signal::Candidate { pane_id: sighting.pane_id.clone() });
                 } else if let Some(candidate) = pane.candidate.as_mut() {
-                    // Still at rest, but the pane painted again: an agent that
-                    // is finished stops writing to the screen, so restart the
-                    // window rather than believe the boundary.
-                    if painted && candidate.armed {
+                    // A pane that moved is no longer describing the tree the
+                    // turn happened in, and snapshotting the new one would file
+                    // the turn against a repository nobody touched.
+                    if moved(&candidate.cwd, &pane.cwd) {
+                        pane.candidate = None;
+                        out.push(Signal::Withdrawn {
+                            pane_id: sighting.pane_id.clone(),
+                            why: Withdrawn::MovedDirectory,
+                        });
+                    } else if painted && candidate.armed {
+                        // Still at rest, but the pane painted again: an agent
+                        // that is finished stops writing to the screen, so
+                        // restart the window rather than believe the boundary.
                         if now < candidate.deadline {
                             candidate.due = (now + self.tuning.settle).min(candidate.deadline);
                         } else {
@@ -318,8 +379,8 @@ impl Detector {
             candidate.armed = false;
             out.push(Signal::Ripe {
                 pane_id: pane_id.clone(),
-                agent: pane.agent.clone(),
-                cwd: pane.cwd.clone(),
+                agent: candidate.agent.clone(),
+                cwd: candidate.cwd.clone(),
                 noisy: candidate.noisy || now >= candidate.deadline,
             });
         }
@@ -336,10 +397,18 @@ impl Detector {
             .min()
     }
 
-    /// Answer a [`Signal::Ripe`].
-    pub fn resolve(&mut self, now: Instant, pane_id: &str, verdict: Verdict) {
+    /// Answer a [`Signal::Ripe`], and say what the answer implies.
+    ///
+    /// A [`Verdict::Wait`] arriving after `patience` has run out is not a wait
+    /// at all: the recorder has been unable to corroborate this boundary for
+    /// the entire window it was given. Retrying it every `settle` for the rest
+    /// of the day would keep the loop blocked on a server that is not
+    /// answering while every other pane goes unrecorded, so the candidate is
+    /// given up instead — loudly.
+    #[must_use]
+    pub fn resolve(&mut self, now: Instant, pane_id: &str, verdict: Verdict) -> Vec<Signal> {
         let Some(pane) = self.panes.get_mut(pane_id) else {
-            return;
+            return Vec::new();
         };
         match verdict {
             Verdict::Settled => {
@@ -352,18 +421,26 @@ impl Detector {
                 pane.worked = false;
             }
             Verdict::Wait => {
-                if let Some(candidate) = pane.candidate.as_mut() {
-                    // Corroboration disagreed with the clock, so give the pane
-                    // another full stretch of patience rather than re-asking
-                    // every `settle` for ever.
-                    let deadline = now + self.tuning.patience;
-                    candidate.armed = true;
-                    candidate.due = (now + self.tuning.settle).min(deadline);
-                    candidate.deadline = deadline;
-                    candidate.noisy = false;
+                let Some(candidate) = pane.candidate.as_mut() else {
+                    return Vec::new();
+                };
+                if now >= candidate.deadline {
+                    pane.candidate = None;
+                    pane.worked = false;
+                    return vec![Signal::Withdrawn {
+                        pane_id: pane_id.to_string(),
+                        why: Withdrawn::Uncorroborated,
+                    }];
                 }
+                candidate.armed = true;
+                // `deadline` is deliberately left where it is. It is the
+                // ceiling on the whole wait, and moving it here is exactly
+                // what would make the retry loop unbounded.
+                candidate.due = (now + self.tuning.settle).min(candidate.deadline);
+                candidate.noisy = false;
             }
         }
+        Vec::new()
     }
 
     /// Forget a pane that closed, exited, or released its agent.
@@ -391,6 +468,15 @@ impl Detector {
 
     pub fn tracked(&self) -> usize {
         self.panes.len()
+    }
+
+    /// Every pane the detector is holding state for.
+    ///
+    /// The recorder prunes against this: `agent.list` is herdr's own authority
+    /// on which panes have agents, and one that has dropped off it is a pane
+    /// whose `worked` flag would otherwise sit there being true for ever.
+    pub fn pane_ids(&self) -> Vec<String> {
+        self.panes.keys().cloned().collect()
     }
 
     /// Whether a candidate is currently pending for this pane.

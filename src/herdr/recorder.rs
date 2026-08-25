@@ -18,10 +18,10 @@ use super::session::{self, Processes, Session};
 use super::wire::{self, Subscription};
 use crate::ops::{self, SnapMeta};
 use crate::repo::Worktree;
-use crate::store::TurnKind;
+use crate::store::{Store, TurnKind};
 use anyhow::Result;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
@@ -33,6 +33,18 @@ const TICK: Duration = Duration::from_secs(1);
 /// How much of the screen to scrape for a prompt. One screen, no scrollback:
 /// a prompt that has already scrolled away is not the one we want.
 const PROMPT_LINES: u32 = 80;
+
+/// How long a "this directory is not a git worktree" answer is trusted.
+///
+/// Short, because it is the answer that stops a pane being recorded at all:
+/// somebody who runs `git init` in a directory an agent is already sitting in
+/// should not have to restart the recorder to be seen.
+const NOT_A_WORKTREE_TTL: Duration = Duration::from_secs(5 * 60);
+
+/// How long a resolved worktree is trusted. `Worktree::discover` is four git
+/// subprocesses, so this is worth caching — but a worktree can be removed, and
+/// nothing else would ever notice.
+const WORKTREE_TTL: Duration = Duration::from_secs(60 * 60);
 
 /// How long herdr should keep showing the turn number. Long enough to survive
 /// a quiet afternoon, short enough that it disappears rather than lying when
@@ -143,6 +155,22 @@ impl Source for LiveSource {
     }
 }
 
+/// A `Worktree::discover` answer and when it was reached.
+struct Resolved {
+    worktree: Option<Worktree>,
+    at: Instant,
+}
+
+impl Resolved {
+    fn is_fresh(&self, now: Instant) -> bool {
+        let ttl = match self.worktree {
+            Some(_) => WORKTREE_TTL,
+            None => NOT_A_WORKTREE_TTL,
+        };
+        now.duration_since(self.at) < ttl
+    }
+}
+
 pub struct Recorder<S: Session> {
     session: S,
     config: Config,
@@ -150,11 +178,19 @@ pub struct Recorder<S: Session> {
     detector: Detector,
     /// The pane's foreground processes when a candidate opened, so we can tell
     /// at the other end of the window whether anything started or finished.
+    ///
+    /// Entries live exactly as long as the candidate that made them. A
+    /// fingerprint left behind by turn N would be compared against turn N+1,
+    /// where a changed pid set is near certain and would cost a whole extra
+    /// window — or, on a changed leader, the turn itself.
     fingerprints: HashMap<String, Processes>,
-    /// `Worktree::discover` shells out to git; a pane's directory does not move
-    /// between turns. `None` records "this is not a git worktree", which is a
-    /// normal state for plenty of panes and must not be re-checked every turn.
-    worktrees: HashMap<String, Option<Worktree>>,
+    /// `Worktree::discover` shells out to git and a pane's directory rarely
+    /// moves, so answers are cached — but only for a while, and only for
+    /// directories some pane still reports. See [`Resolved`].
+    worktrees: HashMap<String, Resolved>,
+    /// `(worktree id, timeline)` pairs already known to have something to
+    /// rewind to. Bounded by the number of checkouts the user runs agents in.
+    baselined: HashSet<(String, String)>,
     /// Turns recorded this run, for the closing line in the log.
     recorded: u64,
 }
@@ -169,6 +205,7 @@ impl<S: Session> Recorder<S> {
             detector,
             fingerprints: HashMap::new(),
             worktrees: HashMap::new(),
+            baselined: HashSet::new(),
             recorded: 0,
         }
     }
@@ -213,21 +250,42 @@ impl<S: Session> Recorder<S> {
         }
     }
 
-    /// Ask herdr what it currently thinks, and feed that in as sightings.
+    /// Ask herdr what it currently thinks, and make our state match it.
     ///
     /// Run at start-up and periodically. Its job is the gap after a reconnect:
-    /// events that happened while we were away are simply gone, and a pane that
-    /// changed status in that window would otherwise be stuck on stale state.
+    /// events that happened while we were away are simply gone, so a pane that
+    /// changed status — or stopped existing — in that window would otherwise be
+    /// stuck on stale state. `pane.closed` and `pane.exited` are exactly the
+    /// events a reconnect loses, so this has to work in both directions: panes
+    /// that dropped off `agent.list` are forgotten, not merely left behind with
+    /// a `worked` flag that stays true for the rest of the day.
     pub fn reconcile(&mut self) {
-        match self.session.agents() {
-            Ok(agents) => {
-                let now = Instant::now();
-                for sighting in agents {
-                    self.observe(now, &sighting);
-                }
+        let agents = match self.session.agents() {
+            Ok(agents) => agents,
+            Err(err) => {
+                self.log.warn(format!("cannot list agents: {err:#}"));
+                return;
             }
-            Err(err) => self.log.warn(format!("cannot list agents: {err:#}")),
+        };
+
+        let live: HashSet<&str> = agents.iter().map(|s| s.pane_id.as_str()).collect();
+        let stale: Vec<String> =
+            self.detector.pane_ids().into_iter().filter(|id| !live.contains(id.as_str())).collect();
+        for pane_id in stale {
+            self.log.info(format!("{pane_id}: herdr no longer lists an agent here; forgetting it"));
+            self.drop_pane(&pane_id);
         }
+
+        let now = Instant::now();
+        for sighting in &agents {
+            self.observe(now, sighting);
+        }
+
+        // Directories nothing points at any more. Re-resolving one costs four
+        // git subprocesses on the next turn that needs it, which is cheaper
+        // than a map that only ever grows in a process meant to run for days.
+        let wanted: HashSet<&str> = agents.iter().filter_map(|s| s.cwd.as_deref()).collect();
+        self.worktrees.retain(|cwd, _| wanted.contains(cwd.as_str()));
     }
 
     fn on_event(&mut self, now: Instant, event: &wire::Event) {
@@ -277,27 +335,121 @@ impl<S: Session> Recorder<S> {
     }
 
     fn act(&mut self, signal: Signal) {
-        match signal {
-            Signal::Started { pane_id } => {
-                let prompt = self.capture_prompt(&pane_id);
-                self.detector.set_prompt(&pane_id, prompt);
-            }
-            Signal::Candidate { pane_id } => {
-                // Snapshot the process group *now*. The comparison at the far
-                // end of the window is what catches an agent that is still
-                // spawning and reaping tools while herdr calls it done.
-                if let Ok(Some(processes)) = self.session.processes(&pane_id) {
-                    self.fingerprints.insert(pane_id, processes);
+        let mut queue = VecDeque::from([signal]);
+        while let Some(signal) = queue.pop_front() {
+            match signal {
+                Signal::Started { pane_id, agent, cwd } => {
+                    let prompt = self.capture_prompt(&pane_id);
+                    self.detector.set_prompt(&pane_id, prompt);
+                    self.baseline(&pane_id, agent.as_deref(), cwd.as_deref());
+                }
+                Signal::Candidate { pane_id } => {
+                    // Snapshot the process group *now*. The comparison at the
+                    // far end of the window is what catches an agent still
+                    // spawning and reaping tools while herdr calls it done.
+                    //
+                    // A read that fails clears the entry rather than leaving
+                    // the last turn's group in the map to be compared against
+                    // this one.
+                    match self.session.processes(&pane_id) {
+                        Ok(Some(processes)) => {
+                            self.fingerprints.insert(pane_id, processes);
+                        }
+                        Ok(None) => {
+                            self.fingerprints.remove(&pane_id);
+                        }
+                        Err(err) => {
+                            self.log.warn(format!(
+                                "{pane_id}: cannot fingerprint the pane's processes: {err:#}"
+                            ));
+                            self.fingerprints.remove(&pane_id);
+                        }
+                    }
+                }
+                Signal::Withdrawn { pane_id, why } => {
+                    self.fingerprints.remove(&pane_id);
+                    self.log.info(format!("{pane_id}: withdrawn — {}", why.as_str()));
+                }
+                Signal::Ripe { pane_id, agent, cwd, noisy } => {
+                    let verdict = self.settle(&pane_id, agent.as_deref(), cwd.as_deref(), noisy);
+                    // The fingerprint belongs to this candidate. Only a wait
+                    // keeps it, and then only the freshly read one that
+                    // `settle` left behind.
+                    if verdict != Verdict::Wait {
+                        self.fingerprints.remove(&pane_id);
+                    }
+                    queue.extend(self.detector.resolve(Instant::now(), &pane_id, verdict));
                 }
             }
-            Signal::Withdrawn { pane_id, why } => {
-                self.fingerprints.remove(&pane_id);
-                self.log.info(format!("{pane_id}: withdrawn — {}", why.as_str()));
+        }
+    }
+
+    /// Give a timeline something to rewind *to* before its first turn lands.
+    ///
+    /// `ops::snap` can only tell that nothing changed by comparing against the
+    /// previous turn, so on an empty timeline the first boundary always records
+    /// — `1 file(s) +0 -0` — whether or not the agent did anything. That is the
+    /// mechanism by which a phantom boundary becomes a turn on disk.
+    ///
+    /// Taking the baseline at the *start* of a turn fixes it at the root rather
+    /// than papering over it: the tree before the agent touches anything is
+    /// both the honest thing to compare the turn against and the thing a user
+    /// rewinding their first turn actually wants to land on. It is recorded as
+    /// a checkpoint, because that is what it is — a state kept so you can get
+    /// back to it — and never as a turn, because no agent finished one.
+    fn baseline(&mut self, pane_id: &str, agent: Option<&str>, cwd: Option<&str>) {
+        if self.config.dry_run {
+            return;
+        }
+        let Some(cwd) = cwd else { return };
+        let Some(worktree) = self.worktree(cwd) else { return };
+        let line = self.timeline(pane_id, agent);
+        let key = (worktree.id.clone(), line.clone());
+        if self.baselined.contains(&key) {
+            return;
+        }
+
+        match Store::open(&self.config.state, &worktree.id, &line).and_then(|store| store.all()) {
+            Ok(turns) if !turns.is_empty() => {
+                self.baselined.insert(key);
+                return;
             }
-            Signal::Ripe { pane_id, agent, cwd, noisy } => {
-                let verdict = self.settle(&pane_id, agent.as_deref(), cwd.as_deref(), noisy);
-                self.detector.resolve(Instant::now(), &pane_id, verdict);
+            Ok(_) => {}
+            Err(err) => {
+                self.log.warn(format!("{pane_id}: cannot read the timeline {line}: {err:#}"));
+                return;
             }
+        }
+
+        let meta = SnapMeta {
+            agent: agent.map(str::to_string),
+            pane_id: Some(pane_id.to_string()),
+            prompt: None,
+            note: Some("baseline, before the first recorded turn".into()),
+        };
+        match ops::snap(
+            &worktree,
+            &self.config.state,
+            &line,
+            self.config.file_budget,
+            TurnKind::Checkpoint,
+            meta,
+            true,
+        ) {
+            Ok(turn) => {
+                self.baselined.insert(key);
+                if let Some(turn) = turn {
+                    self.log.info(format!(
+                        "{pane_id}: baseline #{} on {line} — {} file(s) in {}",
+                        turn.seq,
+                        turn.files,
+                        worktree.root.display()
+                    ));
+                }
+            }
+            // Not fatal, and not marked done: a worktree that is mid-rebase now
+            // may well be recordable by the next turn.
+            Err(err) => self.log.warn(format!("{pane_id}: cannot take a baseline: {err:#}")),
         }
     }
 
@@ -328,11 +480,24 @@ impl<S: Session> Recorder<S> {
         // Corroboration one: ask herdr directly rather than trusting the last
         // event we happened to see.
         match self.session.pane(pane_id) {
-            Ok(None) => return Verdict::Drop,
+            Ok(None) => {
+                self.log.info(format!("{pane_id}: the pane is gone; skipped"));
+                return Verdict::Drop;
+            }
             Ok(Some(fresh)) if !fresh.status.is_rest() => {
                 self.log.info(format!(
                     "{pane_id}: herdr now says {} — not a boundary",
                     fresh.status.as_str()
+                ));
+                return Verdict::Drop;
+            }
+            // The detector withdraws a candidate whose pane moves, but only
+            // for moves it saw. Asking outright closes the case where the
+            // event went missing across a reconnect.
+            Ok(Some(fresh)) if fresh.cwd.as_deref().is_some_and(|now| now != cwd) => {
+                self.log.info(format!(
+                    "{pane_id}: the pane is now in {} but the turn happened in {cwd}; skipped",
+                    fresh.cwd.unwrap_or_default()
                 ));
                 return Verdict::Drop;
             }
@@ -347,7 +512,10 @@ impl<S: Session> Recorder<S> {
         // guess about.
         let processes = match self.session.processes(pane_id) {
             Ok(Some(processes)) => processes,
-            Ok(None) => return Verdict::Drop,
+            Ok(None) => {
+                self.log.info(format!("{pane_id}: the pane is gone; skipped"));
+                return Verdict::Drop;
+            }
             Err(err) => {
                 self.log.warn(format!("{pane_id}: cannot read process info: {err:#}"));
                 return Verdict::Wait;
@@ -363,7 +531,6 @@ impl<S: Session> Recorder<S> {
             if before.leader != processes.leader {
                 self.log
                     .info(format!("{pane_id}: the foreground program changed under us; skipped"));
-                self.fingerprints.insert(pane_id.to_string(), processes);
                 return Verdict::Drop;
             }
             if before.pids() != processes.pids() {
@@ -376,7 +543,6 @@ impl<S: Session> Recorder<S> {
             }
         }
         let summary = format!("{}({})", processes.leader_name(), processes.running.len());
-        self.fingerprints.insert(pane_id.to_string(), processes);
 
         let Some(worktree) = self.worktree(cwd) else {
             // Not a git worktree. Normal — plenty of panes are not — so this is
@@ -441,35 +607,29 @@ impl<S: Session> Recorder<S> {
     }
 
     /// The timeline a pane records on.
+    ///
+    /// Handed on raw: [`crate::store::slug`] is what makes a name safe as both
+    /// a file name and a git ref, and both the turn log and the shadow
+    /// repository call it, so cleaning it here as well would only produce a
+    /// second, different answer.
     fn timeline(&self, pane_id: &str, agent: Option<&str>) -> String {
         match self.config.line_by {
-            LineBy::Agent => timeline_name(agent.unwrap_or("agent")),
-            LineBy::Pane => timeline_name(pane_id),
+            LineBy::Agent => agent.unwrap_or("agent").to_string(),
+            LineBy::Pane => pane_id.to_string(),
         }
     }
 
     fn worktree(&mut self, cwd: &str) -> Option<Worktree> {
-        if let Some(found) = self.worktrees.get(cwd) {
-            return found.clone();
+        let now = Instant::now();
+        if let Some(cached) = self.worktrees.get(cwd) {
+            if cached.is_fresh(now) {
+                return cached.worktree.clone();
+            }
         }
-        let found = Worktree::discover(std::path::Path::new(cwd)).ok();
-        self.worktrees.insert(cwd.to_string(), found.clone());
-        found
+        let worktree = Worktree::discover(std::path::Path::new(cwd)).ok();
+        self.worktrees.insert(cwd.to_string(), Resolved { worktree: worktree.clone(), at: now });
+        worktree
     }
-}
-
-/// A timeline name that is safe as both a file name and a git ref.
-///
-/// The shadow repository keeps one ref per timeline, and git refuses a ref
-/// whose name contains a colon — which every herdr pane id does (`w3K:p5`).
-/// The same character class the turn log uses, applied before either sees it,
-/// keeps the ref and the file agreeing on what a timeline is called.
-fn timeline_name(raw: &str) -> String {
-    let cleaned: String = raw
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
-        .collect();
-    if cleaned.is_empty() { "agent".to_string() } else { cleaned }
 }
 
 fn quote(text: &str) -> String {

@@ -21,10 +21,12 @@ pub mod log;
 pub mod prompt;
 pub mod recorder;
 pub mod session;
+pub mod supervise;
 pub mod wire;
 
 pub use cli::WatchArgs;
 pub use detect::{Detector, Sighting, Signal, Status, Tuning, Verdict, Withdrawn};
 pub use recorder::{Config, LineBy, Pump, Recorder, Source};
 pub use session::{Processes, Session};
+pub use supervise::{Next, Supervisor};
 pub use wire::{inside_herdr, request, try_request, ApiError, Event, Subscription};

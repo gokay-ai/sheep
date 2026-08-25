@@ -9,19 +9,12 @@ use super::detect::Tuning;
 use super::log::Log;
 use super::recorder::{Config, Ended, LineBy, LiveSource, Recorder};
 use super::session::Live;
+use super::supervise::{Next, Supervisor};
 use super::wire;
 use crate::repo::{self, DEFAULT_MAX_FILES};
 use anyhow::{bail, Result};
 use clap::Args;
 use std::time::{Duration, Instant};
-
-/// Slowest we retry a subscription. A herdr restart takes seconds; there is no
-/// point hammering the socket in between.
-const BACKOFF_MAX: Duration = Duration::from_secs(30);
-
-/// How long the socket has to stay missing before we call the session dead and
-/// exit cleanly rather than spinning for the rest of the day.
-const GONE_AFTER: Duration = Duration::from_secs(60);
 
 /// How often to re-read herdr's own view of every agent, healing whatever the
 /// stream missed while we were reconnecting.
@@ -107,41 +100,33 @@ pub fn run(args: &WatchArgs) -> Result<()> {
     ));
 
     let mut recorder = Recorder::new(Live, config, log);
-    let mut backoff = Duration::from_millis(500);
-    let mut missing_since: Option<Instant> = None;
+    let mut supervisor = Supervisor::new();
 
     loop {
+        let opened_at = Instant::now();
         match LiveSource::open() {
-            Ok(mut source) => {
-                backoff = Duration::from_millis(500);
-                missing_since = None;
-                match recorder.pump(&mut source) {
-                    Ended::Disconnected => recorder.log().info("herdr closed the event stream"),
-                    Ended::Failed(why) => {
-                        recorder.log().warn(format!("the event stream failed: {why}"))
-                    }
+            Ok(mut source) => match recorder.pump(&mut source) {
+                Ended::Disconnected => recorder.log().info("herdr closed the event stream"),
+                Ended::Failed(why) => {
+                    recorder.log().warn(format!("the event stream failed: {why}"))
                 }
-            }
+            },
             Err(err) => recorder.log().warn(format!("cannot subscribe to herdr: {err:#}")),
         }
 
         // A socket that is present but refusing is a handoff in flight and
         // worth waiting for. One that has stayed missing is a session that
         // really has ended, and the recorder should stop rather than spin.
-        if wire::socket_path().is_some_and(|path| path.exists()) {
-            missing_since = None;
-        } else {
-            let since = *missing_since.get_or_insert_with(Instant::now);
-            if since.elapsed() >= GONE_AFTER {
+        let present = wire::socket_path().is_some_and(|path| path.exists());
+        match supervisor.after(Instant::now(), opened_at.elapsed(), present) {
+            Next::Stop => {
                 recorder.log().info(format!(
                     "the herdr session is gone; {} turn(s) recorded",
                     recorder.recorded()
                 ));
                 return Ok(());
             }
+            Next::Retry(delay) => std::thread::sleep(delay),
         }
-
-        std::thread::sleep(backoff);
-        backoff = (backoff * 2).min(BACKOFF_MAX);
     }
 }
