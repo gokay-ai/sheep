@@ -453,3 +453,81 @@ fn the_detector_can_list_what_it_is_holding() {
     ids.sort();
     assert_eq!(ids, vec!["w1:p1".to_string(), "w1:p2".to_string()]);
 }
+
+#[test]
+fn a_cd_while_the_agent_is_still_working_abandons_the_turn() {
+    // The move that defeats every check made later. Reading the directory when
+    // the boundary opens is too late: the pane has already reported the new
+    // one, so the candidate takes it, and asking herdr outright compares the
+    // new directory against itself and agrees. A turn belongs to the directory
+    // it *started* in, and that is fixed on the edge into `working`.
+    let mut d = detector();
+    let t0 = Instant::now();
+
+    d.observe(t0, &seen_in("w1:p1", "/repo/a", Status::Idle, 9));
+    d.observe(t0 + Duration::from_secs(1), &seen_in("w1:p1", "/repo/a", Status::Working, 10));
+
+    // The pane moves while the agent is still working.
+    let moved =
+        d.observe(t0 + Duration::from_secs(2), &seen_in("w1:p1", "/repo/b", Status::Working, 11));
+    assert_eq!(
+        withdrawn(&moved),
+        Some(Withdrawn::MovedDirectory),
+        "the turn in flight has to be abandoned here, not at the boundary"
+    );
+
+    // ...and only then goes idle.
+    let rest =
+        d.observe(t0 + Duration::from_secs(3), &seen_in("w1:p1", "/repo/b", Status::Idle, 12));
+    assert!(!rest.iter().any(is_candidate), "an abandoned turn does not get a boundary: {rest:?}");
+    assert!(d.tick(t0 + Duration::from_secs(60)).is_empty(), "and nothing ripens later");
+}
+
+#[test]
+fn an_abandoned_turn_is_not_revived_by_more_working_sightings() {
+    // `working` arrives many times a second. If each one re-armed the pane, a
+    // turn abandoned for moving would come back — without a directory.
+    let mut d = detector();
+    let t0 = Instant::now();
+
+    d.observe(t0, &seen_in("w1:p1", "/repo/a", Status::Idle, 9));
+    d.observe(t0 + Duration::from_secs(1), &seen_in("w1:p1", "/repo/a", Status::Working, 10));
+    d.observe(t0 + Duration::from_secs(2), &seen_in("w1:p1", "/repo/b", Status::Working, 11));
+    for step in 3..8 {
+        d.observe(
+            t0 + Duration::from_secs(step),
+            &seen_in("w1:p1", "/repo/b", Status::Working, 11 + step),
+        );
+    }
+
+    let rest =
+        d.observe(t0 + Duration::from_secs(9), &seen_in("w1:p1", "/repo/b", Status::Idle, 30));
+    assert!(!rest.iter().any(is_candidate), "still abandoned: {rest:?}");
+
+    // The pane has to work again, from rest, to earn a new turn.
+    d.observe(t0 + Duration::from_secs(10), &seen_in("w1:p1", "/repo/b", Status::Working, 31));
+    d.observe(t0 + Duration::from_secs(11), &seen_in("w1:p1", "/repo/b", Status::Idle, 32));
+    assert_eq!(
+        ripe_cwd(&d.tick(t0 + Duration::from_secs(15))).as_deref(),
+        Some("/repo/b"),
+        "and that turn belongs to where it started"
+    );
+}
+
+#[test]
+fn a_pane_with_no_turn_in_flight_has_nowhere_to_have_moved_from() {
+    // An idle pane wandering is not an event: there is nothing to abandon, and
+    // treating it as one would put noise in the log all day.
+    let mut d = detector();
+    let t0 = Instant::now();
+
+    d.observe(t0, &seen_in("w1:p1", "/repo/a", Status::Idle, 9));
+    let signals =
+        d.observe(t0 + Duration::from_secs(1), &seen_in("w1:p1", "/repo/b", Status::Idle, 10));
+    assert!(signals.is_empty(), "{signals:?}");
+
+    // And the next turn is bound to wherever it actually starts.
+    d.observe(t0 + Duration::from_secs(2), &seen_in("w1:p1", "/repo/b", Status::Working, 11));
+    d.observe(t0 + Duration::from_secs(3), &seen_in("w1:p1", "/repo/b", Status::Idle, 12));
+    assert_eq!(ripe_cwd(&d.tick(t0 + Duration::from_secs(7))).as_deref(), Some("/repo/b"));
+}

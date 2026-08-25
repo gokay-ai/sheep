@@ -7,7 +7,7 @@
 
 use super::detect::{Sighting, Status};
 use super::wire;
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
 use std::time::Duration;
 
@@ -110,14 +110,31 @@ impl Live {
     }
 }
 
+/// A reply that arrived but does not have the shape the protocol promises.
+///
+/// This is the other side of [`NOT_FOUND`], and it took a second review to
+/// find. Absence has exactly one meaning here — herdr said the thing is not
+/// there — and a success envelope missing the key it is supposed to carry is
+/// not that. Reading it as absence means a renamed field on a protocol bump
+/// silently drops every turn from then on, with the log saying only that the
+/// pane is gone. It has to be an error, so the corroboration waits and says so.
+fn malformed(method: &str, wanted: &str, got: &Value) -> anyhow::Error {
+    let shown = got.to_string();
+    anyhow!("herdr answered {method} without `{wanted}`: {}", &shown[..shown.len().min(200)])
+}
+
 impl Session for Live {
     fn agents(&self) -> Result<Vec<Sighting>> {
         let result = wire::request("agent.list", json!({}))?;
-        Ok(result
+        // Not `unwrap_or_default`: an empty list and a reply carrying no list
+        // at all mean very different things, and `reconcile` prunes against
+        // this. Reading a malformed reply as "no agents anywhere" would forget
+        // every pane in the session at once.
+        let agents = result
             .get("agents")
             .and_then(Value::as_array)
-            .map(|agents| agents.iter().filter_map(sighting).collect())
-            .unwrap_or_default())
+            .ok_or_else(|| malformed("agent.list", "agents", &result))?;
+        Ok(agents.iter().filter_map(sighting).collect())
     }
 
     fn pane(&self, pane_id: &str) -> Result<Option<Sighting>> {
@@ -126,7 +143,8 @@ impl Session for Live {
         else {
             return Ok(None);
         };
-        Ok(result.get("pane").and_then(sighting))
+        let pane = result.get("pane").ok_or_else(|| malformed("pane.get", "pane", &result))?;
+        Ok(Some(sighting(pane).ok_or_else(|| malformed("pane.get", "pane_id", pane))?))
     }
 
     fn processes(&self, pane_id: &str) -> Result<Option<Processes>> {
@@ -135,7 +153,10 @@ impl Session for Live {
         else {
             return Ok(None);
         };
-        Ok(result.get("process_info").and_then(processes))
+        let info = result
+            .get("process_info")
+            .ok_or_else(|| malformed("pane.process_info", "process_info", &result))?;
+        Ok(Some(processes(info)))
     }
 
     fn screen(&self, pane_id: &str, lines: u32) -> Result<Option<String>> {
@@ -148,11 +169,12 @@ impl Session for Live {
         let Some(result) = Live::optional(wire::request("pane.read", params))? else {
             return Ok(None);
         };
-        Ok(result
+        let text = result
             .get("read")
             .and_then(|read| read.get("text"))
             .and_then(Value::as_str)
-            .map(str::to_string))
+            .ok_or_else(|| malformed("pane.read", "read.text", &result))?;
+        Ok(Some(text.to_string()))
     }
 
     fn report_turn(&self, pane_id: &str, seq: u64, ttl: Duration) -> Result<()> {
@@ -168,13 +190,14 @@ impl Session for Live {
 
 /// Read a `PaneInfo`-shaped object into a sighting.
 ///
-/// Panes with no agent are not sightings: Sheep records agent turns, and a
-/// plain shell pane has none. Skipping them here keeps the detector's map to
-/// the panes that can ever produce a boundary.
+/// `None` means the object is not a pane at all — it has no id. A pane with no
+/// *agent* is still a pane, and says so with `agent: None`: whether that is
+/// interesting is the recorder's decision, not this function's. Deciding it
+/// here is what let "herdr stopped attributing an agent to this pane for one
+/// reply" arrive at the corroboration as "the pane no longer exists".
 pub fn sighting(pane: &Value) -> Option<Sighting> {
     let pane_id = pane.get("pane_id").and_then(Value::as_str)?.to_string();
     let agent = pane.get("agent").and_then(Value::as_str).map(str::to_string);
-    agent.as_ref()?;
     Some(Sighting {
         pane_id,
         agent,
@@ -192,7 +215,7 @@ pub fn sighting(pane: &Value) -> Option<Sighting> {
     })
 }
 
-fn processes(info: &Value) -> Option<Processes> {
+fn processes(info: &Value) -> Processes {
     let running = info
         .get("foreground_processes")
         .and_then(Value::as_array)
@@ -212,9 +235,9 @@ fn processes(info: &Value) -> Option<Processes> {
                 .collect()
         })
         .unwrap_or_default();
-    Some(Processes {
+    Processes {
         shell_pid: info.get("shell_pid").and_then(Value::as_u64).unwrap_or(0) as u32,
         leader: info.get("foreground_process_group_id").and_then(Value::as_u64).unwrap_or(0) as u32,
         running,
-    })
+    }
 }

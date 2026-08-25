@@ -19,6 +19,7 @@ use sheep::repo::Worktree;
 use sheep::store::{Store, Turn, TurnKind};
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tempfile::TempDir;
@@ -117,6 +118,14 @@ struct Facts {
     /// Panes that have vanished from `agent.list` without an event saying so —
     /// what a reconnect gap looks like.
     unlisted: Vec<String>,
+    /// Panes herdr answers about without attributing an agent. Before the
+    /// second review this shape reached the recorder as `Ok(None)`, which it
+    /// reads as "the pane is gone", so a single flap cost a turn.
+    unattributed: Vec<String>,
+    /// Panes herdr answers *nothing* for, while they are otherwise alive —
+    /// what a renamed payload key produced. A fake that cannot enter this state
+    /// is why the state survived a review.
+    silent: Vec<String>,
 }
 
 #[derive(Clone, Default)]
@@ -167,6 +176,20 @@ impl Herdr {
         self.0.lock().unwrap().unlisted.retain(|p| p != pane_id);
     }
 
+    /// Answer about the pane, but without an agent on it.
+    fn forget_agent(&self, pane_id: &str, forgotten: bool) {
+        let mut facts = self.0.lock().unwrap();
+        match forgotten {
+            true => facts.unattributed.push(pane_id.to_string()),
+            false => facts.unattributed.retain(|p| p != pane_id),
+        }
+    }
+
+    /// Answer nothing at all for a pane that is nonetheless there.
+    fn answer_nothing_for(&self, pane_id: &str) {
+        self.0.lock().unwrap().silent.push(pane_id.to_string());
+    }
+
     /// Drop a pane out of `agent.list` while leaving it answerable, the way a
     /// released agent looks to a recorder that missed the event.
     fn unlist(&self, pane_id: &str) {
@@ -186,10 +209,16 @@ impl Session for Herdr {
 
     fn pane(&self, pane_id: &str) -> anyhow::Result<Option<Sighting>> {
         let facts = self.0.lock().unwrap();
-        if facts.missing.iter().any(|p| p == pane_id) {
+        if facts.missing.iter().any(|p| p == pane_id) || facts.silent.iter().any(|p| p == pane_id) {
             return Ok(None);
         }
-        Ok(facts.panes.get(pane_id).cloned())
+        let mut pane = facts.panes.get(pane_id).cloned();
+        if facts.unattributed.iter().any(|p| p == pane_id) {
+            if let Some(pane) = pane.as_mut() {
+                pane.agent = None;
+            }
+        }
+        Ok(pane)
     }
 
     fn processes(&self, pane_id: &str) -> anyhow::Result<Option<Processes>> {
@@ -292,6 +321,27 @@ fn status(pane_id: &str, agent: &str, cwd: &Path, status: &str, revision: u64) -
                 "focused": false,
                 "agent": agent,
                 "agent_status": status,
+                "cwd": cwd.display().to_string(),
+                "revision": revision,
+            }
+        }),
+    })
+}
+
+/// A `pane_updated` that carries no agent — herdr momentarily not calling this
+/// pane an agent pane, while it is plainly still painting.
+fn unattributed_paint(pane_id: &str, cwd: &Path, revision: u64) -> Step {
+    Step::Ev(Event {
+        kind: "pane_updated".into(),
+        data: json!({
+            "type": "pane_updated",
+            "pane": {
+                "pane_id": pane_id,
+                "terminal_id": "term_1",
+                "workspace_id": "w1",
+                "tab_id": "w1:t1",
+                "focused": false,
+                "agent_status": "idle",
                 "cwd": cwd.display().to_string(),
                 "revision": revision,
             }
@@ -946,4 +996,153 @@ fn the_pump_says_how_the_stream_ended() {
         Ended::Failed(why) => assert!(why.contains("herdr ended it"), "the reason survives: {why}"),
         other => panic!("expected a reported failure, got {other:?}"),
     }
+}
+
+#[test]
+fn a_cd_while_the_agent_is_still_working_files_nothing_anywhere() {
+    // The auditor's reproduction, end to end. The agent works in one worktree;
+    // the pane reports the other while still `working`; it goes idle. Every
+    // check that reads the directory after that point compares the new one
+    // against itself and agrees, so the turn used to land in a repository the
+    // agent never edited — as a whole-tree first entry, with herdr told `#1`
+    // for a turn that did not happen.
+    let ground = Ground::new();
+    let worked_in = ground.repo("worked-in");
+    let wandered_to = ground.repo("wandered-to");
+    let herdr = Herdr::default();
+    // Herdr's own answer agrees with the move, which is what made asking it
+    // outright no defence at all.
+    herdr
+        .pane("w1:p1", "claude", &wandered_to, Status::Idle)
+        .processes("w1:p1", vec![agent_running(&[4_200])])
+        .screen("w1:p1", "❯ edit the parser\n");
+
+    let steps = vec![
+        status("w1:p1", "claude", &worked_in, "working", 10),
+        edit(worked_in.join("src.rs"), "fn main() { /* the real work */ }\n"),
+        // The pane moves while the agent is still working.
+        status("w1:p1", "claude", &wandered_to, "working", 11),
+        status("w1:p1", "claude", &wandered_to, "idle", 12),
+        Step::Rest(SETTLE_MS * 3),
+    ];
+    let recorder = run(&herdr, &ground.state, false, steps);
+
+    assert!(
+        ground.turns(&wandered_to, "claude").is_empty(),
+        "nothing at all may be filed against a repository the agent never touched"
+    );
+    assert!(
+        ground.recorded(&worked_in, "claude").is_empty(),
+        "and a turn we can no longer vouch for is abandoned, not guessed at"
+    );
+    assert!(
+        ground.baseline(&worked_in, "claude").is_some(),
+        "the baseline still went where the turn began — that is the discrepancy that must never pass"
+    );
+    assert_eq!(recorder.recorded(), 0);
+    assert!(herdr.reported().is_empty(), "and herdr is not told a turn number");
+}
+
+#[test]
+fn a_pane_herdr_stops_attributing_waits_instead_of_losing_the_turn() {
+    // "This pane exists but I am not calling it an agent right now" used to be
+    // indistinguishable from "this pane is gone", and cost the turn outright.
+    // A release is real and will keep saying so until patience runs out; a flap
+    // for one reply must not throw away work.
+    let ground = Ground::new();
+    let repo = ground.repo("work");
+    let herdr = Herdr::default();
+    herdr
+        .pane("w1:p1", "claude", &repo, Status::Idle)
+        .processes("w1:p1", vec![agent_running(&[4_200])])
+        .screen("w1:p1", "❯ keep my turn\n");
+
+    let mut steps = vec![tweak(&herdr, |h| h.forget_agent("w1:p1", true))];
+    steps.extend(one_turn("w1:p1", "claude", &repo, 10, "fn main() { /* kept */ }\n"));
+    // Herdr remembers what it is looking at again, well inside patience.
+    steps.push(tweak(&herdr, |h| h.forget_agent("w1:p1", false)));
+    steps.push(Step::Rest(SETTLE_MS * 3));
+
+    let recorder = run(&herdr, &ground.state, false, steps);
+
+    assert_eq!(
+        ground.recorded(&repo, "claude").len(),
+        1,
+        "the turn survives a flap in agent attribution"
+    );
+    assert_eq!(recorder.recorded(), 1);
+}
+
+#[test]
+fn a_pane_herdr_has_no_answer_for_is_gone_and_only_that() {
+    // The fake can now say "no answer for a pane that is otherwise alive",
+    // which is what a renamed payload key produced. `Ok(None)` has exactly one
+    // meaning left — herdr said the pane is not there — so this is a drop, and
+    // anything that is *not* that has to arrive as an error instead. The shapes
+    // themselves are pinned in `recorder_session.rs`.
+    let ground = Ground::new();
+    let repo = ground.repo("work");
+    let herdr = Herdr::default();
+    herdr
+        .pane("w1:p1", "claude", &repo, Status::Idle)
+        .processes("w1:p1", vec![agent_running(&[4_200])])
+        .screen("w1:p1", "❯ vanish\n");
+    herdr.answer_nothing_for("w1:p1");
+
+    run(&herdr, &ground.state, false, one_turn("w1:p1", "claude", &repo, 10, "fn x() {}\n"));
+
+    assert!(ground.recorded(&repo, "claude").is_empty());
+}
+
+#[test]
+fn a_pane_still_painting_is_watched_even_while_herdr_forgets_its_agent() {
+    // Panes with no agent are ignored, which is right — but only for panes we
+    // are not already following. A pane mid-turn whose attribution flaps must
+    // keep being watched, or its quiet window closes while it is still
+    // painting and the boundary is believed too early.
+    let ground = Ground::new();
+    let repo = ground.repo("work");
+    let herdr = Herdr::default();
+    herdr
+        .pane("w1:p1", "claude", &repo, Status::Idle)
+        .processes("w1:p1", vec![agent_running(&[4_200])])
+        .screen("w1:p1", "❯ keep watching\n");
+
+    let seen_early = Arc::new(AtomicUsize::new(usize::MAX));
+    let probe = {
+        let seen = Arc::clone(&seen_early);
+        let state = ground.state.clone();
+        let repo = repo.clone();
+        Step::Do(Box::new(move || {
+            let id = Worktree::discover(&repo).expect("worktree").id;
+            let turns = Store::open(&state, &id, "claude").unwrap().all().unwrap();
+            seen.store(turns.iter().filter(|t| t.kind == TurnKind::Turn).count(), Ordering::SeqCst);
+        }))
+    };
+
+    let mut steps = vec![
+        status("w1:p1", "claude", &repo, "working", 10),
+        edit(repo.join("src.rs"), "fn main() { /* still going */ }\n"),
+        status("w1:p1", "claude", &repo, "idle", 11),
+    ];
+    // Painting for longer than a whole window, with no agent on any of it.
+    for step in 0..6 {
+        steps.push(Step::Rest(SETTLE_MS / 2));
+        steps.push(unattributed_paint("w1:p1", &repo, 12 + step));
+    }
+    steps.push(probe);
+    steps.push(Step::Rest(SETTLE_MS * 3));
+
+    run(&herdr, &ground.state, false, steps);
+
+    assert_eq!(
+        seen_early.load(Ordering::SeqCst),
+        0,
+        "the window must have been restarted by paints herdr did not attribute"
+    );
+    assert_eq!(
+        ground.recorded(&repo, "claude").len(),
+        1,
+        "and the turn still lands once the pane finally goes quiet"
+    );
 }

@@ -55,8 +55,26 @@ fn always(reply: Value, keep_open: bool) -> (TempDir, PathBuf) {
     (dir, path)
 }
 
-/// A server that acknowledges a subscription, streams `events`, then hangs up.
-fn streaming(events: Vec<Value>) -> (TempDir, PathBuf) {
+/// A server that accepts a connection and then says nothing at all.
+///
+/// This is the shape that used to wedge a watcher for ever: the handshake read
+/// had no deadline, so it blocked upstream of every backoff and give-up policy
+/// the caller had. It has to surface as an error the supervisor can retry.
+fn mute() -> (TempDir, PathBuf) {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("herdr.sock");
+    let listener = UnixListener::bind(&path).unwrap();
+    std::thread::spawn(move || {
+        let held: Vec<_> = listener.incoming().take(1).filter_map(Result::ok).collect();
+        std::thread::sleep(Duration::from_secs(60));
+        drop(held);
+    });
+    (dir, path)
+}
+
+/// A server that acknowledges a subscription, streams `events`, then holds the
+/// connection open for `linger` before hanging up.
+fn streaming_for(events: Vec<Value>, linger: Duration) -> (TempDir, PathBuf) {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("herdr.sock");
     let listener = UnixListener::bind(&path).unwrap();
@@ -81,6 +99,10 @@ fn streaming(events: Vec<Value>) -> (TempDir, PathBuf) {
                 return;
             }
         }
+        // Held open on purpose. A server that hangs up the instant it has
+        // acknowledged is a different case, and one the client cannot even
+        // finish setting up the socket for.
+        std::thread::sleep(linger);
     });
 
     (dir, path)
@@ -171,14 +193,73 @@ fn a_pane_reply_becomes_a_sighting() {
 }
 
 #[test]
-fn a_pane_with_no_agent_is_not_a_sighting() {
-    // Sheep records agent turns. A plain shell pane has none, and tracking it
-    // would only fill the detector with panes that can never produce anything.
+fn a_pane_whose_agent_herdr_forgot_is_still_a_pane() {
+    // It used to come back as `None`, which the corroboration reads as "this
+    // pane no longer exists" and answers by dropping the turn. A pane with no
+    // agent is a pane; whether that is interesting is the recorder's call, and
+    // it can only make it if the difference survives the parse.
     let reply = json!({"id": "x", "result": {"type": "pane_info", "pane": {
         "pane_id": "w1:p9", "terminal_id": "t", "workspace_id": "w1", "tab_id": "w1:t1",
         "focused": false, "agent_status": "unknown", "cwd": "/repo", "revision": 1 }}});
     let (_dir, path) = always(reply, false);
-    assert!(with_socket(&path, || Live.pane("w1:p9").unwrap()).is_none());
+
+    let sighting = with_socket(&path, || Live.pane("w1:p9").unwrap())
+        .expect("a pane herdr answered about is not a pane that is gone");
+    assert_eq!(sighting.pane_id, "w1:p9");
+    assert_eq!(sighting.agent, None, "and it says so plainly");
+}
+
+// ------------------------------------- a reply that arrived but is not right --
+
+#[test]
+fn a_reply_without_the_pane_it_promised_is_a_fault() {
+    // The other side of the not-found allow-list. A success envelope missing
+    // the key it is supposed to carry — a renamed field on a protocol bump —
+    // must not read as absence, or every turn is dropped for ever while the log
+    // says only that the pane is gone.
+    let (_dir, path) = always(json!({"id": "x", "result": {"type": "pane_info"}}), false);
+    with_socket(&path, || {
+        let err = Live.pane("w1:p1").expect_err("a reply with no pane in it is not an absent pane");
+        assert!(err.to_string().contains("without `pane`"), "and it says what was missing: {err}");
+    });
+}
+
+#[test]
+fn a_reply_without_the_process_info_it_promised_is_a_fault() {
+    let (_dir, path) = always(json!({"id": "x", "result": {"type": "pane_process_info"}}), false);
+    with_socket(&path, || {
+        let err = Live.processes("w1:p1").expect_err("a shape we do not understand is a fault");
+        assert!(err.to_string().contains("without `process_info`"), "{err}");
+    });
+}
+
+#[test]
+fn a_reply_without_the_screen_it_promised_is_a_fault() {
+    let (_dir, path) = always(json!({"id": "x", "result": {"type": "pane_read"}}), false);
+    with_socket(&path, || {
+        assert!(Live.screen("w1:p1", 10).is_err(), "prompt capture must not paper over a bump");
+    });
+}
+
+#[test]
+fn an_agent_list_that_lists_nothing_at_all_is_a_fault() {
+    // The most dangerous of the four. `reconcile` prunes against this list, so
+    // reading a malformed reply as "no agents anywhere" forgets every pane in
+    // the session at once — and every one of them loses the turn in flight.
+    let (_dir, path) = always(json!({"id": "x", "result": {"type": "agent_list"}}), false);
+    with_socket(&path, || {
+        let err = Live.agents().expect_err("no list is not an empty list");
+        assert!(err.to_string().contains("without `agents`"), "{err}");
+    });
+}
+
+#[test]
+fn an_agent_list_that_is_genuinely_empty_is_not() {
+    let (_dir, path) =
+        always(json!({"id": "x", "result": {"type": "agent_list", "agents": []}}), false);
+    assert!(
+        with_socket(&path, || Live.agents().expect("an empty session is a fine answer")).is_empty()
+    );
 }
 
 #[test]
@@ -219,13 +300,18 @@ fn the_live_source_hands_events_to_the_loop_and_reports_the_hang_up() {
     // stop a settle window firing on time. This covers that handoff: the
     // acknowledgement, one event across the channel, and the end of the stream
     // arriving as something the supervisor can act on.
-    let (_dir, path) = streaming(vec![json!({
+    // A short linger: long enough that the client finishes setting the socket
+    // up, short enough that the hang-up lands inside the second poll.
+    let (_dir, path) = streaming_for(
+        vec![json!({
         "event": "pane_updated",
         "data": {"type": "pane_updated", "pane": {
             "pane_id": "w1:p1", "terminal_id": "t", "workspace_id": "w1", "tab_id": "w1:t1",
             "focused": false, "agent": "claude", "agent_status": "working",
             "cwd": "/repo", "revision": 7 }}
-    })]);
+        })],
+        Duration::from_secs(1),
+    );
 
     with_socket(&path, || {
         let mut source = LiveSource::open().expect("the acknowledgement should be accepted");
@@ -250,12 +336,28 @@ fn the_live_source_hands_events_to_the_loop_and_reports_the_hang_up() {
 
 #[test]
 fn a_quiet_stream_times_out_rather_than_blocking_the_loop() {
-    let (_dir, path) = streaming(Vec::new());
+    // A session where nothing is happening is the normal case, and the loop
+    // still has settle windows to fire on time.
+    let (_dir, path) = streaming_for(Vec::new(), Duration::from_secs(5));
     with_socket(&path, || {
         let mut source = LiveSource::open().expect("acknowledged");
-        // Whether the fake has hung up yet is a race; either answer proves the
-        // loop got control back inside the deadline, which is the point.
-        let answer = source.poll(Duration::from_millis(200));
-        assert!(matches!(answer, Pump::Idle | Pump::Closed));
+        assert!(matches!(source.poll(Duration::from_millis(200)), Pump::Idle));
     });
+}
+
+#[test]
+fn an_open_that_is_never_answered_is_a_fault_not_a_wedge() {
+    // Slow on purpose: the handshake deadline is what is under test, so this
+    // waits for it. Before it existed, a herdr that accepted the connection and
+    // then went silent blocked this read with no deadline at all — upstream of
+    // the supervisor, so the watcher wedged instead of reconnecting.
+    let (_dir, path) = mute();
+    let began = std::time::Instant::now();
+    with_socket(&path, || {
+        assert!(
+            LiveSource::open().is_err(),
+            "a server that never acknowledges has to surface as an error the supervisor retries"
+        );
+    });
+    assert!(began.elapsed() < Duration::from_secs(30), "and it has to give up, not hang");
 }

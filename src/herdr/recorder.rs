@@ -191,6 +191,16 @@ pub struct Recorder<S: Session> {
     /// `(worktree id, timeline)` pairs already known to have something to
     /// rewind to. Bounded by the number of checkouts the user runs agents in.
     baselined: HashSet<(String, String)>,
+    /// The worktree each pane's turn began in, resolved when the turn started
+    /// and thrown away when it resolves.
+    ///
+    /// The detector already refuses to let a turn wander, but this is the layer
+    /// that makes the consequence impossible rather than merely unlikely: a
+    /// turn is recorded where its baseline went or it is not recorded at all.
+    /// The two checks are independent, which is the point — the last review
+    /// found a directory change the detector absorbed silently, and a backstop
+    /// that shares its reasoning would have absorbed it too.
+    started_in: HashMap<String, String>,
     /// Turns recorded this run, for the closing line in the log.
     recorded: u64,
 }
@@ -206,6 +216,7 @@ impl<S: Session> Recorder<S> {
             fingerprints: HashMap::new(),
             worktrees: HashMap::new(),
             baselined: HashSet::new(),
+            started_in: HashMap::new(),
             recorded: 0,
         }
     }
@@ -320,9 +331,21 @@ impl<S: Session> Recorder<S> {
             self.act(signal);
         }
         self.fingerprints.remove(pane_id);
+        self.started_in.remove(pane_id);
     }
 
     fn observe(&mut self, now: Instant, sighting: &Sighting) {
+        // Sheep records agent turns, so a pane that has never had an agent is
+        // not worth following. One we are already following is: herdr dropping
+        // the attribution for a reply or two must not stop us watching the pane
+        // paint, or a quiet window would close while the agent is still
+        // working. Reading a pane is now allowed to answer "this pane exists
+        // but I am not calling it an agent right now", so this decision lives
+        // here, where it is a decision, rather than in the parser where it
+        // looked like the pane was missing.
+        if sighting.agent.is_none() && !self.detector.is_tracked(&sighting.pane_id) {
+            return;
+        }
         for signal in self.detector.observe(now, sighting) {
             self.act(signal);
         }
@@ -341,6 +364,16 @@ impl<S: Session> Recorder<S> {
                 Signal::Started { pane_id, agent, cwd } => {
                     let prompt = self.capture_prompt(&pane_id);
                     self.detector.set_prompt(&pane_id, prompt);
+                    // Fix the worktree this turn belongs to before the agent
+                    // has done anything, and take the baseline in it.
+                    match cwd.as_deref().and_then(|cwd| self.worktree(cwd)) {
+                        Some(worktree) => {
+                            self.started_in.insert(pane_id.clone(), worktree.id.clone());
+                        }
+                        None => {
+                            self.started_in.remove(&pane_id);
+                        }
+                    }
                     self.baseline(&pane_id, agent.as_deref(), cwd.as_deref());
                 }
                 Signal::Candidate { pane_id } => {
@@ -368,6 +401,7 @@ impl<S: Session> Recorder<S> {
                 }
                 Signal::Withdrawn { pane_id, why } => {
                     self.fingerprints.remove(&pane_id);
+                    self.started_in.remove(&pane_id);
                     self.log.info(format!("{pane_id}: withdrawn — {}", why.as_str()));
                 }
                 Signal::Ripe { pane_id, agent, cwd, noisy } => {
@@ -377,6 +411,7 @@ impl<S: Session> Recorder<S> {
                     // `settle` left behind.
                     if verdict != Verdict::Wait {
                         self.fingerprints.remove(&pane_id);
+                        self.started_in.remove(&pane_id);
                     }
                     queue.extend(self.detector.resolve(Instant::now(), &pane_id, verdict));
                 }
@@ -509,7 +544,10 @@ impl<S: Session> Recorder<S> {
         }
 
         // Corroboration two: the kernel's opinion, which herdr's status is a
-        // guess about.
+        // guess about — and which is also the answer to "herdr has stopped
+        // attributing an agent to this pane". Whether an agent is running is a
+        // question about processes, not about what herdr is willing to call
+        // one, so an attribution that flaps costs nothing here.
         let processes = match self.session.processes(pane_id) {
             Ok(Some(processes)) => processes,
             Ok(None) => {
@@ -549,6 +587,19 @@ impl<S: Session> Recorder<S> {
             // not an error and must not be reported as one.
             return Verdict::Drop;
         };
+
+        // The last line of defence, and deliberately not sharing any reasoning
+        // with the detector's: whatever the events said, a turn is recorded in
+        // the worktree its baseline went to or it is not recorded.
+        if let Some(started_in) = self.started_in.get(pane_id) {
+            if started_in != &worktree.id {
+                self.log.warn(format!(
+                    "{pane_id}: this turn started in {started_in} but would be recorded in {} — refusing",
+                    worktree.id
+                ));
+                return Verdict::Drop;
+            }
+        }
 
         let line = self.timeline(pane_id, agent);
         let scraped = self.detector.prompt(pane_id).map(str::to_string);

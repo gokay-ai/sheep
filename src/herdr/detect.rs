@@ -26,9 +26,14 @@
 //!    false-`done` case, and withdrawing is the whole defence against it.
 //! 4. `blocked` and `unknown` withdraw it too — an agent waiting on the user has
 //!    not finished a turn, and `unknown` means herdr has lost the thread.
-//! 5. The candidate remembers the working directory it opened in. If the pane
-//!    moves before the window closes, the candidate is withdrawn rather than
-//!    filed against a repository the agent never touched.
+//! 5. A turn is bound to the directory it *started* in, recorded on the edge
+//!    into `working` and held until the turn resolves. If the pane moves at any
+//!    point while one is in flight — while the agent is still working, or while
+//!    a candidate is waiting out its window — the turn is abandoned rather than
+//!    filed against a repository the agent never touched. Reading the directory
+//!    when the boundary opens is too late: by then the move has already been
+//!    absorbed, and every later check compares the new directory against
+//!    itself and agrees.
 //! 6. When the window finally elapses the recorder gets [`Signal::Ripe`] and
 //!    corroborates against the live session before anything is written. The
 //!    corroboration can ask to wait, but only until `patience` runs out: a
@@ -176,12 +181,8 @@ impl Default for Tuning {
 
 #[derive(Debug)]
 struct Candidate {
-    /// The agent and working directory at the moment the boundary opened.
-    ///
-    /// Herdr re-sends a pane on `cd`, so the pane's *current* directory is not
-    /// the one the turn happened in — a directory change during a ten-second
-    /// window would otherwise file the turn against a repository the agent
-    /// never touched, and leave the real one with nothing.
+    /// The agent, and the directory the *turn* started in — not the one the
+    /// pane was in when the boundary opened. See [`Pane::working_in`].
     agent: Option<String>,
     cwd: Option<String>,
     /// When the current quiet window closes.
@@ -206,6 +207,15 @@ struct Pane {
     /// pane that is simply sitting at `idle` when Sheep starts would look like
     /// a finished turn the first time anything nudges it.
     worked: bool,
+    /// Where the turn currently in flight began.
+    ///
+    /// This is the value that decides which tree gets snapshotted, and it is
+    /// fixed on the edge into `working`. Herdr re-sends a pane when its
+    /// directory changes, and a change that arrives while the agent is *still
+    /// working* is absorbed silently by every check that reads the directory
+    /// later — including asking herdr outright, which then compares the new
+    /// directory against itself.
+    working_in: Option<String>,
     candidate: Option<Candidate>,
     /// Screen-scraped, captured at the start of the turn. Never authoritative.
     prompt: Option<String>,
@@ -221,19 +231,24 @@ impl Pane {
             // A pane that is already `working` when we first see it has a turn
             // in flight, and its end is a real boundary.
             worked: sighting.status == Status::Working,
+            working_in: match sighting.status {
+                Status::Working => sighting.cwd.clone(),
+                _ => None,
+            },
             candidate: None,
             prompt: None,
         }
     }
 }
 
-/// Whether a pane has moved away from where a candidate opened.
+/// Whether a sighting puts a pane somewhere other than where its turn began.
 ///
 /// A sighting that simply does not carry a directory is not a move: herdr omits
 /// the field rather than reporting a change, and treating silence as a move
-/// would withdraw every candidate on a pane herdr happens to be terse about.
-fn moved(opened_in: &Option<String>, now_in: &Option<String>) -> bool {
-    match (opened_in, now_in) {
+/// would abandon every turn on a pane herdr happens to be terse about. Neither
+/// is a pane with no turn in flight, which has nowhere to have moved from.
+fn moved(started_in: &Option<String>, sighted_in: &Option<String>) -> bool {
+    match (started_in, sighted_in) {
         (Some(before), Some(after)) => before != after,
         _ => false,
     }
@@ -272,8 +287,28 @@ impl Detector {
         if sighting.agent.is_some() {
             pane.agent = sighting.agent.clone();
         }
+
+        // Before anything else, and before the new directory is absorbed: has
+        // the pane moved away from where the turn in flight began? This has to
+        // happen here rather than in the rest arm, because the move that
+        // matters most arrives while the pane is still `working` — and by the
+        // time a boundary opens, the pane, the candidate and herdr's own answer
+        // all agree on the wrong directory.
+        let wandered = moved(&pane.working_in, &sighting.cwd);
         if sighting.cwd.is_some() {
             pane.cwd = sighting.cwd.clone();
+        }
+        if wandered {
+            let in_flight = pane.worked || pane.candidate.is_some();
+            pane.candidate = None;
+            pane.worked = false;
+            pane.working_in = None;
+            if in_flight {
+                out.push(Signal::Withdrawn {
+                    pane_id: sighting.pane_id.clone(),
+                    why: Withdrawn::MovedDirectory,
+                });
+            }
         }
 
         // Herdr's revision only ever climbs. Treating a repeat as new output
@@ -295,8 +330,16 @@ impl Detector {
                         why: Withdrawn::StillWorking,
                     });
                 }
-                pane.worked = true;
+                // Only the edge into `working` starts a turn, and a turn's
+                // "this pane has worked" flag and the directory it belongs to
+                // are set together. They have to be: a turn abandoned partway
+                // through — because the pane moved — must stay abandoned until
+                // the pane rests and works again, and re-setting `worked` on
+                // every `working` sighting would quietly revive it with no
+                // directory attached.
                 if was != Status::Working {
+                    pane.worked = true;
+                    pane.working_in = pane.cwd.clone();
                     out.push(Signal::Started {
                         pane_id: sighting.pane_id.clone(),
                         agent: pane.agent.clone(),
@@ -323,6 +366,7 @@ impl Detector {
                 }
                 // Whatever was in flight is no longer something we can vouch for.
                 pane.worked = false;
+                pane.working_in = None;
             }
 
             Status::Idle | Status::Done => {
@@ -330,7 +374,9 @@ impl Detector {
                     let deadline = now + self.tuning.patience;
                     pane.candidate = Some(Candidate {
                         agent: pane.agent.clone(),
-                        cwd: pane.cwd.clone(),
+                        // Where the work happened, which is not necessarily
+                        // where the pane is standing now.
+                        cwd: pane.working_in.clone(),
                         // Patience is a ceiling on the whole wait, not just on
                         // how often the window may restart.
                         due: (now + self.tuning.settle).min(deadline),
@@ -340,19 +386,11 @@ impl Detector {
                     });
                     out.push(Signal::Candidate { pane_id: sighting.pane_id.clone() });
                 } else if let Some(candidate) = pane.candidate.as_mut() {
-                    // A pane that moved is no longer describing the tree the
-                    // turn happened in, and snapshotting the new one would file
-                    // the turn against a repository nobody touched.
-                    if moved(&candidate.cwd, &pane.cwd) {
-                        pane.candidate = None;
-                        out.push(Signal::Withdrawn {
-                            pane_id: sighting.pane_id.clone(),
-                            why: Withdrawn::MovedDirectory,
-                        });
-                    } else if painted && candidate.armed {
-                        // Still at rest, but the pane painted again: an agent
-                        // that is finished stops writing to the screen, so
-                        // restart the window rather than believe the boundary.
+                    // Still at rest, but the pane painted again: an agent that
+                    // is finished stops writing to the screen, so restart the
+                    // window rather than believe the boundary. A pane that
+                    // moved has already been dealt with above.
+                    if painted && candidate.armed {
                         if now < candidate.deadline {
                             candidate.due = (now + self.tuning.settle).min(candidate.deadline);
                         } else {
@@ -414,11 +452,13 @@ impl Detector {
             Verdict::Settled => {
                 pane.candidate = None;
                 pane.worked = false;
+                pane.working_in = None;
                 pane.prompt = None;
             }
             Verdict::Drop => {
                 pane.candidate = None;
                 pane.worked = false;
+                pane.working_in = None;
             }
             Verdict::Wait => {
                 let Some(candidate) = pane.candidate.as_mut() else {
@@ -427,6 +467,7 @@ impl Detector {
                 if now >= candidate.deadline {
                     pane.candidate = None;
                     pane.worked = false;
+                    pane.working_in = None;
                     return vec![Signal::Withdrawn {
                         pane_id: pane_id.to_string(),
                         why: Withdrawn::Uncorroborated,
@@ -468,6 +509,11 @@ impl Detector {
 
     pub fn tracked(&self) -> usize {
         self.panes.len()
+    }
+
+    /// Whether this pane is one the detector is already following.
+    pub fn is_tracked(&self, pane_id: &str) -> bool {
+        self.panes.contains_key(pane_id)
     }
 
     /// Every pane the detector is holding state for.
