@@ -1,0 +1,22 @@
+[package]
+name = "sheep"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Undo for AI coding agents. Every agent turn becomes a restorable checkpoint."
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+strip = true
+lto = "thin"
+codegen-units = 1
