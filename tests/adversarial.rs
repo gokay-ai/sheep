@@ -616,3 +616,104 @@ fn the_first_turn_reports_the_size_of_the_tree() {
     .unwrap();
     assert_eq!(turn.files, 2, "a baseline turn should describe what it captured, not `0 files`");
 }
+
+#[test]
+fn a_herdr_pane_id_can_name_a_timeline() {
+    // Regression: timelines are named after the pane that produced them, and a
+    // herdr pane id looks like `w31:pW`. The colon is illegal in a git ref, so
+    // recording under a pane id used to fail with
+    // "refusing to update ref with bad name" — which meant the recorder could
+    // not record the one thing it exists to record.
+    let f = Fixture::new();
+    f.write("a.txt", "one\n");
+    f.commit_all("base");
+
+    let line = "w31:pW";
+    let first = ops::snap(
+        &f.wt(),
+        &f.state,
+        line,
+        BUDGET,
+        TurnKind::Turn,
+        SnapMeta { pane_id: Some(line.into()), ..Default::default() },
+        false,
+    )
+    .expect("a pane id must be usable as a timeline name")
+    .expect("the first turn should record");
+
+    f.write("a.txt", "two\n");
+    ops::snap(&f.wt(), &f.state, line, BUDGET, TurnKind::Turn, SnapMeta::default(), false)
+        .unwrap()
+        .unwrap();
+
+    ops::restore(&f.wt(), &f.state, line, &first.seq.to_string(), BUDGET).unwrap();
+    assert_eq!(f.read("a.txt"), "one\n");
+
+    // And it must not collide with the timeline of a differently-spelled pane.
+    let other = ops::snap(
+        &f.wt(),
+        &f.state,
+        "w31/pW",
+        BUDGET,
+        TurnKind::Turn,
+        SnapMeta::default(),
+        false,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(other.seq, 1, "a different timeline must start its own numbering");
+}
+
+#[test]
+fn a_restore_refuses_a_plan_the_tree_has_moved_out_from_under() {
+    // A user reads a plan that says one file. While they read it, the agent
+    // keeps working. Applying a freshly computed plan at that point would write
+    // whatever is true *now*, not what they agreed to — so the plan a user saw
+    // has to be the plan that runs, or none at all.
+    let f = Fixture::new();
+    f.write("a.txt", "one\n");
+    f.commit_all("base");
+    let target = f.snap("turn 1");
+    f.write("a.txt", "two\n");
+    f.snap("turn 2");
+
+    let seen = ops::plan(&f.wt(), &f.state, "default", &target.to_string(), BUDGET).unwrap();
+    let tree_when_the_user_looked = seen.plan.current_tree.clone();
+    assert_eq!(seen.plan.write, vec!["a.txt".to_string()]);
+
+    // The agent keeps going while the plan is on screen.
+    f.write("b.txt", "the agent kept working\n");
+
+    let err = ops::restore_expecting(
+        &f.wt(),
+        &f.state,
+        "default",
+        &target.to_string(),
+        BUDGET,
+        Some(&tree_when_the_user_looked),
+    )
+    .expect_err("a moved tree must stop the restore");
+
+    let stale = err.downcast_ref::<ops::StaleTree>().expect("the caller needs to know why");
+    assert!(
+        stale.plan.remove.contains(&"b.txt".to_string()),
+        "the refusal should carry the plan as it stands now: {:?}",
+        stale.plan
+    );
+    assert_eq!(f.read("a.txt"), "two\n", "nothing may be written by a refused restore");
+    assert!(f.exists("b.txt"), "the agent's newer work must be left alone");
+
+    // And the same call succeeds once it is told the truth.
+    let fresh = ops::plan(&f.wt(), &f.state, "default", &target.to_string(), BUDGET).unwrap();
+    ops::restore_expecting(
+        &f.wt(),
+        &f.state,
+        "default",
+        &target.to_string(),
+        BUDGET,
+        Some(&fresh.plan.current_tree),
+    )
+    .expect("a plan that matches the tree must apply");
+    assert_eq!(f.read("a.txt"), "one\n");
+    assert!(!f.exists("b.txt"));
+}
