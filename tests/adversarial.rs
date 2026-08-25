@@ -1073,3 +1073,197 @@ fn a_bookkeeping_failure_after_a_restore_is_not_reported_as_a_failed_restore() {
         "a restore that landed carries the bookkeeping problem as a note, not as a failure"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Found by an adversarial audit of the merged tree, after the first five
+// data-loss paths had been closed. Each of these was reproduced end to end
+// before it was fixed.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_restore_never_writes_over_bytes_no_snapshot_holds() {
+    // The removal side refuses directories. The write side had no guard at all,
+    // and `checkout-index -f` clears its own ground: git's remove_subtree fires
+    // whenever a write target exists as a directory. So a one-line plan —
+    // `write build` — recursively deleted a gitignored tree that
+    // `prune_empty_dirs` had just deliberately declined to touch, and which
+    // `git add -A` can never have captured, so the checkpoint was empty of it.
+    let f = Fixture::new();
+    f.write("build", "at first this path is a file\n");
+    f.write(".gitignore", "build/\n");
+    f.commit_all("base");
+    let as_file = f.snap("turn 1");
+
+    // The path becomes an ignored directory holding real work.
+    fs::remove_file(f.repo.join("build")).unwrap();
+    f.write("build/artifact.bin", "expensive to regenerate\n");
+    f.write("build/.env", "SECRET=hunter2\n");
+    f.snap("turn 2");
+
+    let planned = ops::plan(&f.wt(), &f.state, "default", &as_file.to_string(), BUDGET).unwrap();
+    assert!(
+        planned.plan.write.contains(&"build".to_string()),
+        "the plan should want to write the file back: {:?}",
+        planned.plan
+    );
+
+    let err = ops::restore(&f.wt(), &f.state, "default", &as_file.to_string(), BUDGET)
+        .expect_err("writing over a directory Sheep never captured must be refused");
+    assert!(err.to_string().contains("build"), "the refusal should name it: {err}");
+
+    assert!(f.exists("build/artifact.bin"), "the ignored tree must survive");
+    assert_eq!(f.read("build/.env"), "SECRET=hunter2\n");
+}
+
+#[test]
+fn a_nested_repository_is_not_clobbered_by_a_write_either() {
+    // The same hole reached from the other direction: a tracked file whose path
+    // later becomes a repository. `git add -A` records that as a gitlink, so the
+    // current tree holds a commit pointer where the plan wants to write a blob.
+    let f = Fixture::new();
+    f.write("vendor", "at first this path is a file\n");
+    f.commit_all("base");
+    let as_file = f.snap("turn 1");
+
+    fs::remove_file(f.repo.join("vendor")).unwrap();
+    let vendor = f.repo.join("vendor");
+    fs::create_dir_all(&vendor).unwrap();
+    git(&vendor, &["init", "--quiet", "-b", "main"]);
+    fs::write(vendor.join("work.txt"), "uncommitted work nobody else has\n").unwrap();
+    fs::write(vendor.join("tracked.txt"), "committed inside vendor\n").unwrap();
+    git(&vendor, &["add", "-A"]);
+    git(&vendor, &["commit", "--quiet", "-m", "vendor base"]);
+    f.snap("turn 2");
+
+    let err = ops::restore(&f.wt(), &f.state, "default", &as_file.to_string(), BUDGET)
+        .expect_err("writing over a nested repository must be refused");
+    assert!(err.to_string().contains("vendor"), "the refusal should name it: {err}");
+    assert!(vendor.join(".git").is_dir(), "the nested repository's history must survive");
+    assert_eq!(
+        fs::read_to_string(vendor.join("work.txt")).unwrap(),
+        "uncommitted work nobody else has\n"
+    );
+}
+
+#[test]
+fn a_tracked_file_an_ignore_rule_matches_is_still_captured() {
+    // The scratch index starts empty, so every path in it looked untracked, and
+    // git applies ignore rules only to untracked paths. Real git never does
+    // this, because its index already knows what is tracked. The result was
+    // that a file the repository *tracks* was in no snapshot at all, while
+    // `doctor` counted it and reported `status ready`.
+    let f = Fixture::new();
+    f.write("config/app.env", "PORT=8080\n");
+    f.write("normal.txt", "one\n");
+    f.commit_all("base");
+    // The rule arrives after the file is already tracked — an everyday event
+    // when an agent tidies a .gitignore mid-session.
+    f.write(".gitignore", "*.env\n");
+    f.commit_all("ignore env files");
+
+    let captured = f.snap("turn 1");
+    f.write("config/app.env", "PORT=9999\n");
+    f.write("normal.txt", "two\n");
+    f.snap("turn 2");
+
+    let planned = ops::plan(&f.wt(), &f.state, "default", &captured.to_string(), BUDGET).unwrap();
+    assert!(
+        planned.plan.write.contains(&"config/app.env".to_string()),
+        "a tracked file must be in the plan even when an ignore rule matches it: {:?}",
+        planned.plan
+    );
+
+    ops::restore(&f.wt(), &f.state, "default", &captured.to_string(), BUDGET).unwrap();
+    assert_eq!(f.read("config/app.env"), "PORT=8080\n", "a tracked file must round-trip");
+    assert_eq!(f.read("normal.txt"), "one\n");
+}
+
+#[test]
+fn a_genuinely_untracked_ignored_file_is_still_left_alone() {
+    // The companion to the test above: staging tracked paths explicitly must not
+    // start capturing things invariant 8 promises never to touch.
+    let f = Fixture::new();
+    f.write(".gitignore", ".env\nnode_modules/\n");
+    f.write("a.txt", "one\n");
+    f.commit_all("base");
+    let first = f.snap("turn 1");
+
+    f.write(".env", "SECRET=hunter2\n");
+    f.write("node_modules/left-pad/index.js", "module.exports = 1\n");
+    f.write("a.txt", "two\n");
+    f.snap("turn 2");
+
+    let planned = ops::plan(&f.wt(), &f.state, "default", &first.to_string(), BUDGET).unwrap();
+    assert!(
+        !planned.plan.remove.iter().any(|p| p.contains(".env") || p.contains("node_modules")),
+        "an untracked ignored path must never enter a plan: {:?}",
+        planned.plan
+    );
+    ops::restore(&f.wt(), &f.state, "default", &first.to_string(), BUDGET).unwrap();
+    assert_eq!(f.read(".env"), "SECRET=hunter2\n");
+    assert!(f.exists("node_modules/left-pad/index.js"));
+}
+
+#[test]
+fn a_path_sheep_cannot_name_is_refused_rather_than_silently_skipped() {
+    let mut plan = sheep::shadow::RestorePlan::default();
+    plan.remove.push("caf\u{FFFD}.txt".to_string());
+    plan.target_tree = "0".repeat(40);
+    plan.current_tree = "0".repeat(40);
+
+    let f = Fixture::new();
+    f.write("a.txt", "one\n");
+    f.commit_all("base");
+    f.snap("turn 1");
+    let shadow = sheep::shadow::Shadow::ensure(f.wt(), &f.state).unwrap();
+
+    let err = shadow.apply(&plan).expect_err("a path we cannot address must not be acted on");
+    assert!(
+        err.to_string().contains("not valid UTF-8"),
+        "a removal that would silently no-op must be a refusal instead: {err}"
+    );
+}
+
+#[test]
+fn line_endings_survive_a_hostile_global_gitconfig() {
+    // The shadow reads repo-local config from its own bare git dir, never the
+    // user's — but it inherited the *machine's* global config, where
+    // `core.autocrlf = input` is routine advice on macOS and Linux. A CRLF file
+    // was recorded as LF and written back as LF; the checkpoint was normalised
+    // on the way in too, so the undo did not restore the original bytes either;
+    // and `sheep snap` afterwards said "nothing changed since the last turn",
+    // so Sheep could not see the damage it had done.
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let f = Fixture::new();
+    let hostile = f.repo.parent().unwrap().join("hostile.gitconfig");
+    fs::write(&hostile, "[core]\n\tautocrlf = input\n").unwrap();
+
+    let previous = std::env::var("GIT_CONFIG_GLOBAL").ok();
+    std::env::set_var("GIT_CONFIG_GLOBAL", &hostile);
+
+    let crlf = b"line one\r\nline two\r\n";
+    fs::write(f.repo.join("windows.bat"), crlf).unwrap();
+    // Commit with the file's bytes as they are, so the repository itself is not
+    // the thing that normalised them.
+    git(&f.repo, &["-c", "core.autocrlf=false", "add", "-A"]);
+    git(&f.repo, &["-c", "core.autocrlf=false", "commit", "--quiet", "-m", "base"]);
+
+    let intact = f.snap("turn 1");
+    fs::write(f.repo.join("windows.bat"), b"CHANGED\r\n").unwrap();
+    f.snap("turn 2");
+    ops::restore(&f.wt(), &f.state, "default", &intact.to_string(), BUDGET).unwrap();
+
+    let after = fs::read(f.repo.join("windows.bat")).unwrap();
+
+    match previous {
+        Some(value) => std::env::set_var("GIT_CONFIG_GLOBAL", value),
+        None => std::env::remove_var("GIT_CONFIG_GLOBAL"),
+    }
+
+    assert_eq!(
+        after, crlf,
+        "the bytes written back must be the bytes recorded, whatever the machine's gitconfig says"
+    );
+}

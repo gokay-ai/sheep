@@ -155,11 +155,33 @@ impl Shadow {
     }
 
     fn git(&self) -> Git {
+        // Byte-verbatim, always.
+        //
+        // The shadow reads repo-local config from its own bare git dir, never
+        // the user's — but it still inherits the *machine's* global config, and
+        // `core.autocrlf` there turns a snapshot into a normalisation and a
+        // restore into a rewrite. With `autocrlf = input` (routine advice on
+        // macOS and Linux) a CRLF file is recorded as LF and written back as
+        // LF, the checkpoint is normalised on the way in too, and `sheep snap`
+        // afterwards reports "nothing changed" — so Sheep cannot even see the
+        // damage it did.
+        //
+        // `GIT_CONFIG_KEY_n` outranks every config file, so these three settle
+        // it for good. In-tree `.gitattributes` is deliberately still honoured:
+        // a repository that pins `eol=lf` for itself round-trips the same way
+        // its own `git checkout` would.
         Git::scoped(&self.git_dir, &self.worktree.root)
             .with_env("GIT_AUTHOR_NAME", IDENT_NAME)
             .with_env("GIT_AUTHOR_EMAIL", IDENT_EMAIL)
             .with_env("GIT_COMMITTER_NAME", IDENT_NAME)
             .with_env("GIT_COMMITTER_EMAIL", IDENT_EMAIL)
+            .with_env("GIT_CONFIG_COUNT", "3")
+            .with_env("GIT_CONFIG_KEY_0", "core.autocrlf")
+            .with_env("GIT_CONFIG_VALUE_0", "false")
+            .with_env("GIT_CONFIG_KEY_1", "core.eol")
+            .with_env("GIT_CONFIG_VALUE_1", "lf")
+            .with_env("GIT_CONFIG_KEY_2", "core.safecrlf")
+            .with_env("GIT_CONFIG_VALUE_2", "false")
     }
 
     fn scratch_index(&self, tag: &str) -> PathBuf {
@@ -178,6 +200,59 @@ impl Shadow {
         let git = self.git().with_index(&index);
         git.run(&["add", "-A", "--", "."])
             .context("failed to stage the working tree into Sheep's scratch index")?;
+
+        // `add -A` alone is not enough, and the reason is subtle.
+        //
+        // The scratch index starts empty, so every path in it looks untracked —
+        // and git applies `.gitignore`, `info/exclude` and `core.excludesFile`
+        // only to untracked paths. Real git never does this, because its index
+        // already knows what is tracked. The consequence is that a file the
+        // user's repository *tracks* but some exclude rule happens to match is
+        // in no snapshot at all, and worse: when a rule starts matching a file
+        // an earlier turn did capture — an agent adding `.env` to `.gitignore`
+        // mid-session — the old content is in the target tree, the live content
+        // is in neither the current tree nor the checkpoint, so a restore
+        // writes stale bytes over a live secret and the offered undo then
+        // deletes it outright.
+        //
+        // So stage everything the user's repository tracks, explicitly and
+        // forcibly, on top. `-A` with a pathspec still records deletions.
+        // Only paths that are still on disk: the sweep above already recorded
+        // every deletion, and an explicit pathspec matching nothing is a fatal
+        // error rather than a no-op.
+        let tracked = self.worktree.git().output(&["ls-files", "-z"])?;
+        let present: Vec<u8> = if tracked.status.success() {
+            String::from_utf8_lossy(&tracked.stdout)
+                .split('\0')
+                .filter(|rel| !rel.is_empty())
+                // Still a file, specifically. `ls-files` names files, so a path
+                // that is now a directory means the tracked file is gone — the
+                // sweep above already recorded that — and force-adding the
+                // directory instead would drag every ignored thing beneath it
+                // into the snapshot, which is invariant 8 broken from the
+                // inside.
+                .filter(|rel| {
+                    std::fs::symlink_metadata(self.worktree.root.join(rel))
+                        .is_ok_and(|m| !m.is_dir())
+                })
+                .flat_map(|rel| rel.bytes().chain(std::iter::once(0)))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        if !present.is_empty() {
+            let out = git.run_stdin(
+                &["add", "-A", "-f", "--pathspec-from-file=-", "--pathspec-file-nul"],
+                &present,
+            )?;
+            if !out.status.success() {
+                bail!(
+                    "failed to stage tracked files into Sheep's scratch index: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                );
+            }
+        }
+
         let tree = git.run(&["write-tree"])?;
         let _ = std::fs::remove_file(&index);
         Ok(tree)
@@ -337,6 +412,29 @@ impl Shadow {
         self.batch_check(&probes)
     }
 
+    /// What git resolves `<tree>:<path>` to, per path: `blob`, `commit` for a
+    /// gitlink, `tree`, or `None` when the tree has no such entry.
+    fn kinds_in_tree(&self, tree: &str, paths: &[String]) -> Result<Vec<Option<String>>> {
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        let input = paths.iter().map(|p| format!("{tree}:{p}\n")).collect::<String>();
+        let out = self.git().run_stdin(&["cat-file", "--batch-check"], input.as_bytes())?;
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let mut kinds: Vec<Option<String>> = stdout
+            .lines()
+            .map(|line| {
+                if line.ends_with(" missing") {
+                    None
+                } else {
+                    line.split_whitespace().nth(1).map(str::to_string)
+                }
+            })
+            .collect();
+        kinds.resize(paths.len(), None);
+        Ok(kinds)
+    }
+
     /// Confirm only the blobs a restore would actually read.
     ///
     /// `checkout-index` touches nothing outside the plan, so verifying the
@@ -410,6 +508,68 @@ impl Shadow {
         }
 
         let root = &self.worktree.root;
+
+        // Nothing may be written over bytes that are in no snapshot.
+        //
+        // The removal guard below refuses directories, but `checkout-index -f`
+        // has its own way of clearing the ground: git's `remove_subtree()`
+        // fires whenever a write target exists as a directory, so a one-line
+        // plan — `write vendor` — recursively deletes a nested repository, its
+        // history and its uncommitted work, or a gitignored subtree that
+        // `prune_empty_dirs` had just deliberately declined to touch. `git
+        // add -A` can never have captured any of it, so the checkpoint is empty
+        // of it and the advertised undo restores an empty directory.
+        //
+        // Stated as the invariant rather than as a list of shapes: if something
+        // is on disk at a path we are about to write, and the tree we just
+        // recorded does not hold that path as a blob, then those bytes are in
+        // no snapshot and are not ours to replace. That covers the directory,
+        // the nested repository and the file an exclude rule hid from us, and
+        // it cannot fire on an ordinary overwrite or an ordinary new file.
+        let recorded = self.kinds_in_tree(&plan.current_tree, &plan.write)?;
+        let doomed: std::collections::HashSet<&str> =
+            plan.remove.iter().map(String::as_str).collect();
+        let mut unrecorded: Vec<&String> = Vec::new();
+        for (rel, kind) in plan.write.iter().zip(recorded.iter()) {
+            let path = root.join(rel);
+            let Ok(meta) = std::fs::symlink_metadata(&path) else { continue };
+            let ours = if meta.is_dir() {
+                // A path that changed from a directory to a file is legitimate,
+                // and the removals run first — so a directory the plan empties
+                // completely is ours to replace. One holding anything the plan
+                // does not remove is not, and that is the nested repository and
+                // the ignored tree.
+                survivors(&path, root, &doomed)?.is_empty()
+            } else {
+                kind.as_deref() == Some("blob")
+            };
+            if !ours {
+                unrecorded.push(rel);
+            }
+        }
+        if let Some(first) = unrecorded.first() {
+            bail!(
+                "refusing to restore: `{first}` is on disk but its current contents are in no snapshot{}.\nWriting over it would destroy something Sheep never captured, and the checkpoint could not bring it back. A repository nested in your worktree, or a path an ignore rule hides, both look like this.",
+                if unrecorded.len() > 1 {
+                    format!(" (and {} more)", unrecorded.len() - 1)
+                } else {
+                    String::new()
+                }
+            );
+        }
+
+        // A path git handed back that we could not decode is a path we cannot
+        // act on: a removal silently no-ops and Sheep reports a deletion that
+        // did not happen, and a write bails with a message about garbage
+        // collection that has nothing to do with it. Invariant 3 says refuse
+        // rather than half-apply.
+        if let Some(bad) =
+            plan.write.iter().chain(plan.remove.iter()).find(|p| p.contains('\u{FFFD}'))
+        {
+            bail!(
+                "refusing to restore: `{bad}` is not valid UTF-8, so Sheep cannot address it reliably. Rename it, or restore with git directly."
+            );
+        }
 
         // A removal is always a single file: `diff-tree -r` reports leaves, and
         // an emptied directory is pruned afterwards. A removal that is a
@@ -529,6 +689,38 @@ impl Shadow {
         }
         Ok((files, adds, dels))
     }
+}
+
+/// Files under `dir` that `doomed` does not name, relative to `root`.
+///
+/// Stops at the first survivor: the caller only asks whether the plan empties
+/// the directory, so walking the rest of a vendored checkout is wasted work.
+fn survivors(
+    dir: &Path,
+    root: &Path,
+    doomed: &std::collections::HashSet<&str>,
+) -> Result<Vec<String>> {
+    let mut found = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else { return Ok(found) };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let meta = match entry.metadata() {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if meta.is_dir() {
+            found.extend(survivors(&path, root, doomed)?);
+        } else {
+            let rel = path.strip_prefix(root).unwrap_or(&path).to_string_lossy().to_string();
+            if !doomed.contains(rel.as_str()) {
+                found.push(rel);
+            }
+        }
+        if !found.is_empty() {
+            break;
+        }
+    }
+    Ok(found)
 }
 
 /// After removing files, drop directories the removal emptied — but never the
