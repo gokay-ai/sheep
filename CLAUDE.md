@@ -85,7 +85,15 @@ in the real one. Precedence: `HERDR_PLUGIN_STATE_DIR` > `SHEEP_STATE_DIR` > `XDG
 ## Conventions
 
 - **English** everywhere in the repository: code, comments, docs, commit messages.
-- No dependency that needs a C toolchain — the binary must cross-compile to macOS, Linux and
-  Windows without one. That is why the turn log is NDJSON and git is a subprocess, not libgit2.
+- No dependency that needs a C toolchain — the binary must cross-compile to macOS and Linux
+  without one, and to Windows the day that is claimed. That is why the turn log is NDJSON and git
+  is a subprocess, not libgit2.
+- **Linux and macOS are the only platforms anything here claims.** `wire::connect` has no non-unix
+  arm, so on Windows every herdr call fails and `sheep watch` cannot record a turn; it now refuses
+  at startup instead of looping and exiting 0. The manifest declares `["linux", "macos"]`, no
+  `.exe` is released, there is no Windows CI leg and there is no PowerShell surface — it is in git
+  history and comes back with the transport. `cargo clippy --target
+  x86_64-pc-windows-msvc --all-targets -- -D warnings` is not a gate today; the one thing standing
+  between the tree and a clean run is `wire::REQUEST_TIMEOUT`, which wants `#[cfg(unix)]`.
 - Git's batch plumbing deadlocks if you write all of stdin before reading stdout. Use
   `Git::run_stdin`, which streams on its own thread; read the comment there before changing it.

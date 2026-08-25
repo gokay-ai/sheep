@@ -13,12 +13,21 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Linux and macOS, because those are the two platforms anything in this
+  # repository claims. There was a `windows-latest` leg here; it had never
+  # compiled — `tests/tui_flow.rs` used `std::os::unix::fs::PermissionsExt`
+  # ungated and `wire::REQUEST_TIMEOUT` is dead code without a unix socket to
+  # time out — so it was red on every push, which is exactly why nobody noticed
+  # that the recorder could not record a single turn there. Sheep no longer
+  # declares Windows in the plugin manifest and no longer publishes a Windows
+  # binary; a gate for a platform nothing claims is a gate nobody reads. It
+  # comes back with the named-pipe transport, alongside the claim.
   check:
     name: fmt + clippy + test (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
@@ -31,9 +40,8 @@ jobs:
 
       - run: cargo fmt --check
 
-      # All three legs run clippy on purpose: `-D warnings` fires on different
-      # code per platform, so a cfg(unix)-only helper that is dead on Windows
-      # only ever fails the Windows leg.
+      # Both legs run clippy on purpose: `-D warnings` fires on different code
+      # per platform, and macOS and Linux already differ enough to be worth it.
       - run: cargo clippy --all-targets --locked -- -D warnings
 
       - run: cargo test --locked
@@ -62,27 +70,3 @@ jobs:
           manifest=$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' herdr-plugin/herdr-plugin.toml | head -n 1)
           echo "crate=$crate manifest=$manifest"
           test "$crate" = "$manifest"
-
-  plugin-windows:
-    name: plugin installer (windows)
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: PSScriptAnalyzer
-        shell: pwsh
-        run: |
-          Install-Module PSScriptAnalyzer -Force -Scope CurrentUser -ErrorAction Stop
-          $results = Invoke-ScriptAnalyzer -Path herdr-plugin -Recurse -Severity Error
-          if ($results) { $results | Format-Table -AutoSize | Out-String | Write-Host; exit 1 }
-
-      # No network and no release to fetch from, so this only proves the script
-      # parses, finds the manifest and resolves the Windows asset name.
-      - name: installer dry run
-        shell: pwsh
-        run: |
-          $output = & .\herdr-plugin\install.ps1 -DryRun
-          $output | Write-Host
-          if (-not ($output -match 'sheep-x86_64-pc-windows-msvc\.exe')) {
-            throw 'install.ps1 did not resolve the expected Windows asset name'
-          }

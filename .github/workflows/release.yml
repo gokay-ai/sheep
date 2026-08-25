@@ -44,8 +44,12 @@ jobs:
           # Alpine included, where the gnu build cannot start at all.
           - target: x86_64-unknown-linux-musl
             os: ubuntu-22.04
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
+          # No Windows target. Sheep's recorder is herdr's session API and
+          # `src/herdr/wire.rs` has no non-unix transport for it, so a published
+          # `.exe` would install, report "recorder started" and record nothing.
+          # The manifest declares linux and macos only; this matrix and
+          # `install.sh`'s platform detection agree with it, and
+          # `test-install.sh` asserts all three still do.
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
@@ -86,10 +90,10 @@ jobs:
           TARGET: ${{ matrix.target }}
         run: |
           set -eu
+          # Every target here is unix, so there is no executable suffix. The
+          # variable stays so the day a Windows target comes back is a one-line
+          # change here rather than a rewrite.
           suffix=""
-          case "$TARGET" in
-            *windows*) suffix=".exe" ;;
-          esac
           asset="sheep-$TARGET$suffix"
           mkdir -p dist
           cp "target/$TARGET/release/sheep$suffix" "dist/$asset"

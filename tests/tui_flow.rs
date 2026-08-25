@@ -703,6 +703,14 @@ fn a_restore_that_could_not_be_undone_is_reported_as_a_moved_tree() {
 
 /// And the real thing, end to end: a restore whose write cannot land, through
 /// `engine::execute` against a real repository.
+///
+/// Unix only: the failure has to be *arranged*, and the only portable way to
+/// make a write fail without racing it is to take write permission off the
+/// directory. `PermissionsExt` is a unix trait, and it went ungated here long
+/// enough for the Windows CI leg to be red on every push — which is how the
+/// recorder came to be shipped as Windows-supported while it could not record
+/// a single turn there.
+#[cfg(unix)]
 #[test]
 fn a_restore_whose_write_fails_reports_what_ops_did_about_it() {
     let fixture = Fixture::new();

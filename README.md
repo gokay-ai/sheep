@@ -35,6 +35,8 @@ herdr plugin install gokay-ai/sheep/herdr-plugin
 
 No Rust needed: the install step downloads a checksum-verified binary for your platform, registers the timeline dock, the rewind overlay and the recorder, and starts recording. Herdr 0.8 reads keybindings from your own config, so paste [`herdr-plugin/keybindings.toml`](herdr-plugin/keybindings.toml) into `~/.config/herdr/config.toml` to get `prefix+Z` for the dock and `prefix+z` for the rewind overlay; until then, `herdr plugin action invoke dock --plugin sheep` and `… invoke rewind --plugin sheep` do the same thing.
 
+**Linux and macOS.** Not Windows, and that is a claim rather than an oversight: Sheep's recorder *is* herdr's session API, Sheep speaks it over a unix socket, and there is no transport for it on Windows — so `sheep watch` could not see an agent finish a turn there, and a dock beside it would sit empty saying nothing had happened. Sheep used to declare Windows in its manifest and ship a whole PowerShell surface for it anyway; that is gone, `sheep watch` refuses on a non-unix build rather than looping quietly, and no `.exe` is published. It comes back when the transport does. The CLI half is git plumbing and would very likely be fine on Windows, but "very likely" is not a supported platform: nothing has ever run it there, `sheep`'s state directory has no `%LOCALAPPDATA%` fallback, and until both are fixed it is not claimed.
+
 ## "Claude Code already has `/rewind`"
 
 It does, and if you run one agent, in one session, on one checkout — use it. Sheep exists for the setup where that stops being enough.
@@ -233,17 +235,17 @@ Then `herdr server reload-config`. Without that row the metadata is reported and
 
 Other environment: `SHEEP_STATE_DIR` overrides where state lives, with precedence `HERDR_PLUGIN_STATE_DIR` > `SHEEP_STATE_DIR` > `XDG_STATE_HOME` > `~/.local/state/sheep`. Set it when you are experimenting so nothing lands in the real one.
 
-Keybindings live in your herdr config rather than in the plugin manifest — herdr 0.8 reads the key map from `config.toml` only. [`herdr-plugin/keybindings.toml`](herdr-plugin/keybindings.toml) is the two bindings ready to paste, Windows action ids included.
+Keybindings live in your herdr config rather than in the plugin manifest — herdr 0.8 reads the key map from `config.toml` only. [`herdr-plugin/keybindings.toml`](herdr-plugin/keybindings.toml) is the two bindings ready to paste.
 
 ### Building it yourself
 
 ```bash
 cargo build --release        # target/release/sheep
-cargo test                   # 180 tests
+cargo test                   # 188 tests
 cargo clippy --all-targets -- -D warnings && cargo fmt --check
 ```
 
-CI runs fmt, clippy and the tests on Linux, macOS and Windows; releases are built natively for six targets with one `SHA256SUMS`.
+CI runs fmt, clippy and the tests on Linux and macOS — the two platforms Sheep claims — plus shellcheck and an installer round trip that asserts `install.sh` and the release matrix ask for exactly the same asset names. Releases are built natively for five targets with one `SHA256SUMS`.
 
 ## Prior art, and thanks
 
