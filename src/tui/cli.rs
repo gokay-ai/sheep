@@ -118,7 +118,10 @@ fn open(cwd: &Path, line: &str) -> std::result::Result<Ctx, Fatal> {
 /// Bring the app to the state the flags describe, running every job on this
 /// thread. Used for `--snapshot` and for the first frame of `--rewind`, where
 /// there is no point drawing a loading state nobody will see.
-fn settle(ctx: &Ctx, app: &mut App, args: &UiArgs) {
+///
+/// Public so a test can drive the whole `UiArgs` surface — including the one
+/// thing standing between `--keys` and a write nobody authorised.
+pub fn settle(ctx: &Ctx, app: &mut App, args: &UiArgs) {
     app.reload();
     pump(ctx, app);
     if let Some(target) = &args.select {
@@ -130,16 +133,25 @@ fn settle(ctx: &Ctx, app: &mut App, args: &UiArgs) {
     }
     if let Some(keys) = &args.keys {
         for ch in keys.chars() {
-            if ch == 'R' {
-                continue;
-            }
-            app.on_key(match ch {
-                '\n' | '\r' => Key::Enter,
-                '\x1b' => Key::Esc,
-                other => Key::Char(other),
-            });
+            let Some(key) = scripted_key(ch) else { continue };
+            app.on_key(key);
             pump(ctx, app);
         }
+    }
+}
+
+/// Translate one character of `--keys`, or refuse it.
+///
+/// `R` is the only key that writes, and it is refused here: a restore is
+/// reachable only from a plan a human has looked at, and a string on a command
+/// line is not that. `--keys` runs before the first frame is drawn, so letting
+/// `R` through would rewrite a worktree with nothing ever shown to anyone.
+pub fn scripted_key(ch: char) -> Option<Key> {
+    match ch {
+        'R' => None,
+        '\n' | '\r' => Some(Key::Enter),
+        '\x1b' => Some(Key::Esc),
+        other => Some(Key::Char(other)),
     }
 }
 

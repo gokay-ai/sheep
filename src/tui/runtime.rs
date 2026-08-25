@@ -46,22 +46,45 @@ pub trait Screen {
     fn render(&mut self, app: &App) -> Result<()>;
 }
 
+/// What one poll of the worker found.
+///
+/// `Gone` is why this is not an `Option<Reply>`. A worker whose thread has
+/// ended and a worker that is simply busy look identical through a
+/// `try_recv().ok()`, and the difference matters: a restore that will never be
+/// answered would otherwise leave the interface drawing "restoring…" for ever,
+/// and quitting would cost the full grace period and then report a worktree
+/// that may be half-restored — a false alarm if the thread died in `plan`,
+/// before the checkpoint and before a byte was written.
+pub enum Pumped {
+    Reply(Reply),
+    /// Nothing yet. The worker is alive.
+    Idle,
+    /// The worker ended. Nothing will ever answer.
+    Gone,
+}
+
 /// The worker, or whatever a test puts in its place.
 pub trait Jobs {
     fn send(&self, job: Job);
-    fn try_recv(&self) -> Option<Reply>;
+    fn poll(&self) -> Pumped;
 }
 
 /// A worker is optional: the interface still runs, and still quits cleanly,
-/// when there is no worktree to give it one.
+/// when there is no worktree to give it one. That case is `Idle` rather than
+/// `Gone` — nothing was ever expected to answer, so nothing is missing.
 impl Jobs for Option<Worker> {
     fn send(&self, job: Job) {
         if let Some(worker) = self {
             worker.send(job);
         }
     }
-    fn try_recv(&self) -> Option<Reply> {
-        self.as_ref().and_then(|worker| worker.replies.try_recv().ok())
+    fn poll(&self) -> Pumped {
+        let Some(worker) = self else { return Pumped::Idle };
+        match worker.replies.try_recv() {
+            Ok(reply) => Pumped::Reply(reply),
+            Err(std::sync::mpsc::TryRecvError::Empty) => Pumped::Idle,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => Pumped::Gone,
+        }
     }
 }
 
@@ -82,6 +105,9 @@ pub fn run(
     // reason to abandon a write half-done, so the error is carried to the exit
     // rather than returned from the middle of one.
     let mut failure: Option<anyhow::Error> = None;
+    // A worker that ended is a different kind of trouble: the screen still
+    // works, so the reason stays up and the user leaves when they have read it.
+    let mut lost: Option<anyhow::Error> = None;
     let mut leaving_since: Option<u64> = None;
 
     loop {
@@ -104,11 +130,24 @@ pub fn run(
         }
 
         let was_restoring = app.restoring;
-        while let Some(reply) = jobs.try_recv() {
-            app.apply(reply);
+        loop {
+            match jobs.poll() {
+                Pumped::Reply(reply) => app.apply(reply),
+                Pumped::Idle => break,
+                Pumped::Gone => {
+                    if lost.is_none() {
+                        lost = Some(anyhow::anyhow!(app.worker_lost()));
+                    }
+                    break;
+                }
+            }
         }
-        for job in app.take_jobs() {
-            jobs.send(job);
+        if lost.is_none() {
+            for job in app.take_jobs() {
+                jobs.send(job);
+            }
+        } else {
+            app.take_jobs();
         }
         // A restore just ended. Anything typed while it ran is sitting in the
         // terminal's buffer aimed at a screen that no longer exists — a refusal
@@ -124,7 +163,7 @@ pub fn run(
 
         if app.quit || failure.is_some() {
             if !app.restoring {
-                return match failure {
+                return match failure.or(lost) {
                     Some(e) => Err(e),
                     None => Ok(()),
                 };
@@ -134,7 +173,7 @@ pub fn run(
                 let note = format!(
                     "left with a restore still running after {FINISH_GRACE_SECS}s; the worktree may be half-restored. Run `sheep log` and `sheep diff` before trusting it."
                 );
-                return Err(match failure {
+                return Err(match failure.or(lost) {
                     Some(e) => e.context(note),
                     None => anyhow::anyhow!(note),
                 });

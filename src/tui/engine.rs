@@ -169,6 +169,13 @@ pub enum Reply {
     RestoreFailed {
         req: u64,
         message: String,
+        /// The working tree is no longer either state.
+        ///
+        /// `shadow::apply` deletes before it writes, so a failure between the
+        /// two leaves files already gone. `ops` tries to put them back and says
+        /// whether it managed; only when it did not is anything on screen —
+        /// the plan, the "nothing is written yet" border — still true.
+        tree_moved: bool,
     },
 }
 
@@ -203,9 +210,28 @@ pub fn execute(ctx: &Ctx, job: Job) -> Reply {
             match restore(ctx, seq, &expect_tree, pane.as_deref(), notify) {
                 Ok(Ok(outcome)) => Reply::Restored { req, outcome },
                 Ok(Err(plan)) => Reply::Stale { req, plan },
-                Err(e) => Reply::RestoreFailed { req, message: format!("{e:#}") },
+                Err(e) => restore_failure(req, &e),
             }
         }
+    }
+}
+
+/// How a failed restore becomes something the interface can say.
+///
+/// Split out because the case that matters most — `ops` could not put the tree
+/// back — cannot be arranged against real git without changing a directory's
+/// permissions between two of its calls. The mapping is the claim; this is
+/// where it can be checked.
+pub fn restore_failure(req: u64, error: &anyhow::Error) -> Reply {
+    match error.downcast_ref::<ops::RestoreFailed>() {
+        // `ops` already phrases both cases correctly, including the way back.
+        // Repeating it here is how the two drift apart.
+        Some(failed) => {
+            Reply::RestoreFailed { req, message: failed.to_string(), tree_moved: !failed.recovered }
+        }
+        // Every other failure happens before `apply`, which is the only thing
+        // that touches the working tree.
+        None => Reply::RestoreFailed { req, message: format!("{error:#}"), tree_moved: false },
     }
 }
 
@@ -421,6 +447,16 @@ impl Worker {
 
     pub fn send(&self, job: Job) {
         let _ = self.jobs.send(job);
+    }
+
+    /// Build a worker over channels somebody else owns.
+    ///
+    /// [`Self::spawn`] is this plus a thread. It is public because the one
+    /// state that matters and cannot otherwise be produced — a worker whose
+    /// thread has ended, so its replies will never arrive — is a dropped
+    /// sender, and the interface's behaviour there is worth pinning.
+    pub fn from_channels(jobs: Sender<Job>, replies: Receiver<Reply>) -> Self {
+        Self { jobs, replies }
     }
 }
 

@@ -403,6 +403,202 @@ fn the_refusal_screen_does_not_leave_the_previous_plans_diff_beside_the_new_one(
     assert_eq!(asked, vec!["src/api/order.ts"], "the refusal has to refetch the evidence");
 }
 
+/// Open the diff for a path, then get refused with a plan that contains *the
+/// same path*. The hunks must be fetched again: they were computed against a
+/// tree that no longer describes the working directory, and serving them from
+/// the cache would put a stale diff under a fresh file list — the exact defect
+/// with a different route in.
+#[test]
+fn a_refusal_refetches_hunks_for_a_path_the_new_plan_still_contains() {
+    let mut app = demo();
+    app.on_key(Key::Down);
+    open_rewind(&mut app, plan_view());
+
+    app.on_key(Key::Char('d'));
+    let jobs = app.take_jobs();
+    let Some(Job::Patch { req, path, .. }) = jobs.first().cloned() else { panic!("no patch job") };
+    assert_eq!(path, "src/api/cart.ts");
+    app.apply(Reply::Patched { req, path, body: "@@ -1 +1 @@\n-hunks from the old tree".into() });
+    shows(&frame(&app, 100, 26), "hunks from the old tree");
+
+    app.on_key(Key::Char('R'));
+    let jobs = app.take_jobs();
+    let Some(Job::Restore { req, .. }) =
+        jobs.into_iter().find(|j| matches!(j, Job::Restore { .. }))
+    else {
+        panic!("no restore job")
+    };
+    // The new plan keeps cart.ts and drops the rest.
+    app.apply(Reply::Stale {
+        req,
+        plan: PlanView {
+            seq: 2,
+            commit: "2faeca7e387e0000000000000000000000000000".into(),
+            target_tree: "tt".into(),
+            current_tree: "moved".into(),
+            written: 1,
+            removed: 0,
+            files: vec![(Action::Write, "src/api/cart.ts".into())],
+        },
+    });
+
+    let asked: Vec<String> = app
+        .take_jobs()
+        .into_iter()
+        .filter_map(|j| match j {
+            Job::Patch { path, .. } => Some(path),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        asked,
+        vec!["src/api/cart.ts"],
+        "the hunks must be read again, not served from a cache keyed on a tree that has moved"
+    );
+    assert!(
+        matches!(&app.patch, PatchState::Loading(p) if p == "src/api/cart.ts"),
+        "expected a fresh fetch, got {:?}",
+        app.patch
+    );
+    hides(&frame(&app, 100, 26), "hunks from the old tree");
+}
+
+/// The worst thing the interface could say. `shadow::apply` deletes before it
+/// writes, so a failure in between leaves files already gone — and the old
+/// screen answered that with "nothing was written" over a border still
+/// promising a dry run.
+#[test]
+fn a_restore_that_stopped_partway_is_not_reported_as_nothing_written() {
+    let mut app = demo();
+    app.on_key(Key::Down);
+    open_rewind(&mut app, plan_view());
+    app.on_key(Key::Char('R'));
+    let jobs = app.take_jobs();
+    let Some(Job::Restore { req, .. }) =
+        jobs.into_iter().find(|j| matches!(j, Job::Restore { .. }))
+    else {
+        panic!("no restore job")
+    };
+    app.apply(Reply::RestoreFailed {
+        req,
+        message: "the restore failed: cannot write src/api/cart.ts: Permission denied (os error 13).                   Your working tree is between two states — `sheep restore #4 --yes` returns it to how it was."
+            .into(),
+        tree_moved: true,
+    });
+
+    let screen = frame(&app, 92, 26);
+    hides(&screen, "nothing was written");
+    hides(&screen, "dry run — nothing is written yet");
+    shows(&screen, "the restore stopped partway — your files are between two states");
+    shows(&screen, "Permission denied");
+    // The last clause of the message is the way back; a status block that cuts
+    // the sentence short throws away the only thing the user can act on.
+    shows(&screen, "`sheep restore #4 --yes` returns it to how it was.");
+    shows(&screen, "this worktree is between two states");
+    // and no key that would write again is offered on a tree in this state
+    hides(&screen, "shift+R");
+
+    // Narrow, where the message has to wrap: the last clause is the way back,
+    // and a status block that runs out of room throws away the only thing the
+    // user can act on.
+    let narrow = frame(&app, 58, 30);
+    shows(&narrow, "it to how it was.");
+    hides(&narrow, "nothing was written");
+
+    // Escaping back to the dock does not make it go away.
+    app.on_key(Key::Esc);
+    let dock = frame(&app, 92, 26);
+    shows(&dock, "this worktree is between two states");
+    shows(&dock, "unsafe");
+    shows(&dock, "Permission denied");
+}
+
+/// The recovered case: `ops` put the files back, so the tree is exactly as it
+/// was and nothing on screen needs a warning.
+#[test]
+fn a_restore_that_was_undone_for_us_says_so_and_leaves_no_warning() {
+    let mut app = demo();
+    app.on_key(Key::Down);
+    open_rewind(&mut app, plan_view());
+    app.on_key(Key::Char('R'));
+    let jobs = app.take_jobs();
+    let Some(Job::Restore { req, .. }) =
+        jobs.into_iter().find(|j| matches!(j, Job::Restore { .. }))
+    else {
+        panic!("no restore job")
+    };
+    // The wording a real failure produces, verbatim from `ops`.
+    app.apply(Reply::RestoreFailed {
+        req,
+        message: "the restore failed: restore failed while writing files: error: unable to create \
+                  file locked/discount.ts: Permission denied. Your files were put back as they were."
+            .into(),
+        tree_moved: false,
+    });
+
+    let screen = frame(&app, 92, 26);
+    shows(&screen, "your files are as they were");
+    shows(&screen, "put back as they were.");
+    hides(&screen, "this worktree is between two states");
+    // The plan is still true — the tree is exactly what it was — so the file
+    // list stays up and the key stays offered.
+    shows(&screen, "will be written (2)");
+    shows(&screen, "shift+R");
+
+    // Narrow, where it has to wrap. Here the status block is the only thing
+    // carrying the message — the plan is still `Ready`, so the body is the file
+    // list — and a block that runs out of room silently drops the clause that
+    // says what actually became of the files.
+    shows(&frame(&app, 58, 30), "put back as they were.");
+
+    app.on_key(Key::Esc);
+    hides(&frame(&app, 92, 26), "unsafe");
+}
+
+/// The evidence pane's own failure. Nothing rendered it before, so its wording
+/// was whatever the last edit left behind.
+#[test]
+fn a_patch_that_cannot_be_read_says_so_in_the_pane() {
+    let mut app = demo();
+    app.on_key(Key::Down);
+    open_rewind(&mut app, plan_view());
+    app.on_key(Key::Char('d'));
+    let jobs = app.take_jobs();
+    let Some(Job::Patch { req, path, .. }) = jobs.first().cloned() else { panic!("no patch job") };
+    app.apply(Reply::PatchFailed {
+        req,
+        path,
+        message: "git diff-tree failed: fatal: bad object 4b825dc".into(),
+    });
+    let screen = frame(&app, 96, 24);
+    shows(&screen, "src/api/cart.ts");
+    shows(&screen, "bad object 4b825dc");
+    // the plan itself is untouched by a preview that could not be read
+    shows(&screen, "will be written (2)");
+    shows(&screen, "shift+R");
+}
+
+/// A timeline Sheep cannot read at all. The dock has to say why rather than
+/// showing an empty box that looks like "nothing has happened yet".
+#[test]
+fn a_timeline_that_cannot_be_read_says_why() {
+    let mut app = demo();
+    app.apply(Reply::Broken("cannot read /state/turns/x.ndjson: Permission denied".into()));
+    let screen = frame(&app, 80, 20);
+    shows(&screen, "cannot read /state/turns/x.ndjson");
+    shows(&screen, "Permission denied");
+}
+
+#[test]
+fn a_single_file_turn_is_not_described_in_the_plural() {
+    let mut one = turn(1, TurnKind::Turn, 4);
+    one.files = 1;
+    one.parent = Some("p".into());
+    let screen = frame(&app_with(vec![one]), 80, 12);
+    shows(&screen, "1 file ");
+    hides(&screen, "1 files");
+}
+
 #[test]
 fn the_help_overlay_documents_the_restore_key() {
     let mut app = demo();

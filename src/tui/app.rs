@@ -108,6 +108,11 @@ pub struct App {
     patch_cache: HashMap<String, String>,
     pub blockers: Vec<String>,
     pub warnings: Vec<String>,
+    /// Set when the working tree may not be in any state Sheep recorded: a
+    /// restore that stopped between its deletions and its writes, or a worker
+    /// that vanished while one was running. It outlives the status line
+    /// deliberately — it is a property of the checkout, not of a message.
+    pub uncertain: Option<String>,
     pub fatal: Option<Fatal>,
     pub status: Option<Status>,
     pub restoring: bool,
@@ -146,6 +151,7 @@ impl App {
             patch_cache: HashMap::new(),
             blockers: Vec::new(),
             warnings: Vec::new(),
+            uncertain: None,
             fatal: None,
             status: None,
             restoring: false,
@@ -171,6 +177,15 @@ impl App {
         self
     }
 
+    /// Which turn the plan on screen was for, however that plan ended up.
+    fn plan_seq(&self) -> u64 {
+        match &self.plan {
+            PlanState::Ready(plan) => plan.seq,
+            PlanState::Loading(seq) | PlanState::Failed { seq, .. } => *seq,
+            PlanState::Idle => self.selected().map(|t| t.seq).unwrap_or(0),
+        }
+    }
+
     pub fn selected(&self) -> Option<&Turn> {
         self.turns.get(self.sel)
     }
@@ -184,6 +199,32 @@ impl App {
         self.selected()
             .and_then(|t| t.pane_id.clone())
             .or_else(|| self.turns.iter().find_map(|t| t.pane_id.clone()))
+    }
+
+    /// The worker ended without answering. Returns the sentence to report.
+    ///
+    /// Nothing more can be planned or restored, so the interface stops waiting
+    /// rather than drawing a spinner for a reply that is not coming. What it
+    /// must not do is guess: if a restore was in flight, the thread could have
+    /// died anywhere between reading the timeline and writing the last file.
+    pub fn worker_lost(&mut self) -> String {
+        let mid_write = self.restoring;
+        self.restoring = false;
+        let message = if mid_write {
+            "sheep's worker stopped while a restore was running. Whether anything was written is \
+             not known — run `sheep log` and `sheep diff` before trusting this worktree."
+                .to_string()
+        } else {
+            "sheep's worker stopped. The timeline on screen is the last thing it read; nothing \
+             more can be planned or restored."
+                .to_string()
+        };
+        if mid_write {
+            self.uncertain = Some(message.clone());
+            self.plan = PlanState::Failed { seq: self.plan_seq(), message: message.clone() };
+        }
+        self.status = Some(Status::new(Level::Bad, [message.clone()]));
+        message
     }
 
     pub fn take_jobs(&mut self) -> Vec<Job> {
@@ -490,6 +531,8 @@ impl App {
             Reply::Restored { req, outcome } => {
                 if req == self.restore_req {
                     self.restoring = false;
+                    // The tree is a snapshot again, whatever it was before.
+                    self.uncertain = None;
                     self.mode = Mode::Dock;
                     self.plan = PlanState::Idle;
                     self.patch = PatchState::Idle;
@@ -498,13 +541,23 @@ impl App {
                     self.reload();
                 }
             }
-            Reply::RestoreFailed { req, message } => {
+            Reply::RestoreFailed { req, message, tree_moved } => {
                 if req == self.restore_req {
                     self.restoring = false;
-                    self.status = Some(Status::new(
-                        Level::Bad,
-                        ["the restore did not happen — nothing was written".to_string(), message],
-                    ));
+                    let headline = if tree_moved {
+                        // Saying "nothing was written" here is the worst thing
+                        // the interface can do: it is a denial read while
+                        // sitting on exactly the tree the design exists to
+                        // prevent.
+                        self.uncertain = Some(message.clone());
+                        self.plan =
+                            PlanState::Failed { seq: self.plan_seq(), message: message.clone() };
+                        "the restore stopped partway — your files are between two states"
+                    } else {
+                        "the restore did not complete — your files are as they were"
+                    };
+                    self.status = Some(Status::new(Level::Bad, [headline.to_string(), message]));
+                    self.reload();
                 }
             }
         }

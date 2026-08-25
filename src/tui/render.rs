@@ -149,7 +149,11 @@ fn draw_dock(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn header(app: &App, width: usize) -> Vec<Line<'static>> {
-    let health: Vec<Span<'static>> = if app.loading {
+    // A tree nobody can vouch for outranks "busy": the reload that follows a
+    // failed restore must not replace the warning with a spinner.
+    let health: Vec<Span<'static>> = if app.uncertain.is_some() {
+        vec![Span::styled("unsafe", theme::danger())]
+    } else if app.loading {
         vec![Span::styled(format!("{} reading", spinner(app)), theme::dim())]
     } else if !app.blockers.is_empty() {
         vec![Span::styled("blocked", theme::danger())]
@@ -198,12 +202,18 @@ fn header(app: &App, width: usize) -> Vec<Line<'static>> {
 /// A blocker is the difference between "Sheep is idle" and "Sheep cannot run".
 /// It gets its own band above the timeline rather than a line in a footer.
 fn banner(app: &App, width: usize) -> Vec<Line<'static>> {
-    let Some(blocker) = app.blockers.first() else { return Vec::new() };
+    // A tree that is between two states outranks anything else the dock could
+    // say about itself, and it stays up until a restore puts it right.
+    let (heading, detail) = match (&app.uncertain, app.blockers.first()) {
+        (Some(why), _) => ("this worktree is between two states", why),
+        (None, Some(blocker)) => ("cannot record or restore", blocker),
+        (None, None) => return Vec::new(),
+    };
     let mut lines = vec![Line::from(vec![
         Span::styled("▌", theme::danger()),
-        Span::styled(" cannot record or restore ", theme::danger()),
+        Span::styled(format!(" {heading} "), theme::danger()),
     ])];
-    for chunk in text::wrap(blocker, width.saturating_sub(2)).into_iter().take(3) {
+    for chunk in text::wrap(detail, width.saturating_sub(2)).into_iter().take(4) {
         lines.push(Line::from(vec![
             Span::styled("▌", theme::danger()),
             Span::styled(format!(" {chunk}"), theme::plain()),
@@ -219,6 +229,10 @@ fn status_block(app: &App, width: usize) -> Vec<Line<'static>> {
         Level::Bad => (theme::danger(), theme::danger()),
         Level::Info => (theme::accent(), theme::plain()),
     };
+    // A failure gets the room to finish its sentence. Cutting one off loses the
+    // way back — `sheep restore #N --yes` is the last clause of the message
+    // that matters most, and a five-line cap ate it.
+    let cap = if *level == Level::Bad { 9 } else { 3 };
     let mut out = Vec::new();
     for (i, line) in lines.iter().enumerate() {
         let style = if i == 0 { first } else { theme::dim() };
@@ -227,7 +241,7 @@ fn status_block(app: &App, width: usize) -> Vec<Line<'static>> {
                 Span::styled("▌", bar),
                 Span::styled(format!(" {chunk}"), style),
             ]));
-            if out.len() >= 5 {
+            if out.len() >= cap {
                 return out;
             }
         }
@@ -474,6 +488,10 @@ fn draw_rewind(frame: &mut Frame, area: Rect, app: &App) {
                 // The frame that says "restoring…" in its body must not say
                 // "nothing is written yet" on its border.
                 Span::styled(" writing — do not interrupt ", theme::danger())
+            } else if app.uncertain.is_some() {
+                // Nor may it go back to promising a dry run once a write has
+                // already half-happened.
+                Span::styled(" this worktree is between two states ", theme::danger())
             } else {
                 Span::styled(" dry run — nothing is written yet ", theme::dim())
             })

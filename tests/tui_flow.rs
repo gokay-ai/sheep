@@ -8,7 +8,8 @@
 use sheep::ops::{self, SnapMeta};
 use sheep::repo::{Worktree, DEFAULT_MAX_FILES};
 use sheep::store::{Store, TurnKind};
-use sheep::tui::app::{App, Key, Level, Mode, PlanState};
+use sheep::tui::app::{self, App, Key, Level, Mode, PlanState};
+use sheep::tui::cli::{self, UiArgs};
 use sheep::tui::engine::{self, Action, Ctx, Job, Notice, PlanView, Reply};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -602,6 +603,226 @@ fn quitting_during_a_restore_leaves_the_write_in_flight_for_the_runtime_to_finis
         },
     });
     assert!(!app.restoring);
+}
+
+/// The mapping from a failed restore to what the interface says. The case that
+/// matters — `ops` could not put the tree back — cannot be arranged against
+/// real git without changing a directory's permissions between two of its
+/// calls, so it is checked here against the error `ops` would hand over.
+#[test]
+fn a_restore_that_could_not_be_undone_is_reported_as_a_moved_tree() {
+    let unrecovered: anyhow::Error = ops::RestoreFailed {
+        recovered: false,
+        checkpoint_seq: Some(4),
+        cause: "cannot write src/a.ts: Permission denied (os error 13)".into(),
+        recovery_error: Some("cannot create src/a.ts".into()),
+    }
+    .into();
+    match engine::restore_failure(7, &unrecovered) {
+        Reply::RestoreFailed { req, message, tree_moved } => {
+            assert_eq!(req, 7);
+            assert!(tree_moved, "ops could not put the tree back, so it is between two states");
+            // the operation's own words, not a second phrasing that can drift
+            assert_eq!(message, unrecovered.to_string());
+            assert!(message.contains("`sheep restore #4 --yes`"), "{message}");
+        }
+        other => panic!("expected a failure reply, got {other:?}"),
+    }
+
+    let recovered: anyhow::Error = ops::RestoreFailed {
+        recovered: true,
+        checkpoint_seq: Some(4),
+        cause: "cannot write src/a.ts".into(),
+        recovery_error: None,
+    }
+    .into();
+    match engine::restore_failure(7, &recovered) {
+        Reply::RestoreFailed { tree_moved, message, .. } => {
+            assert!(!tree_moved, "the files were put back, so nothing is uncertain");
+            assert!(message.contains("put back as they were"), "{message}");
+        }
+        other => panic!("expected a failure reply, got {other:?}"),
+    }
+
+    // Anything that is not a `RestoreFailed` happened before `apply`, which is
+    // the only thing that touches the working tree.
+    let early = anyhow::anyhow!("refusing to continue: a rebase is in progress.");
+    match engine::restore_failure(7, &early) {
+        Reply::RestoreFailed { tree_moved, message, .. } => {
+            assert!(!tree_moved);
+            assert!(message.contains("a rebase is in progress"), "{message}");
+        }
+        other => panic!("expected a failure reply, got {other:?}"),
+    }
+}
+
+/// And the real thing, end to end: a restore whose write cannot land, through
+/// `engine::execute` against a real repository.
+#[test]
+fn a_restore_whose_write_fails_reports_what_ops_did_about_it() {
+    let fixture = Fixture::new();
+    fixture.write("locked/present.txt", "one\n");
+    fixture.write("top.txt", "top\n");
+    git(&fixture.repo, &["add", "-A"]);
+    git(&fixture.repo, &["commit", "--quiet", "-m", "init"]);
+    let good = fixture.snap("claude", "before");
+
+    // Turn #2 drops the file inside `locked/` and adds one at the root, so a
+    // restore to #1 must delete `extra.txt` and then re-create
+    // `locked/present.txt` — a creation, which needs write permission on the
+    // directory.
+    fs::remove_file(fixture.repo.join("locked/present.txt")).unwrap();
+    fixture.write("extra.txt", "added by the turn that went wrong\n");
+    fixture.snap("claude", "after");
+
+    let locked = fixture.repo.join("locked");
+    fs::set_permissions(&locked, std::os::unix::fs::PermissionsExt::from_mode(0o555)).unwrap();
+    let enforced = fs::File::create(locked.join("probe")).is_err();
+    if !enforced {
+        let _ = fs::remove_file(locked.join("probe"));
+        let _ = fs::set_permissions(&locked, std::os::unix::fs::PermissionsExt::from_mode(0o755));
+        eprintln!("skipped: this filesystem does not enforce directory permissions");
+        return;
+    }
+
+    let ctx = fixture.ctx();
+    let Reply::Planned { plan, .. } = engine::execute(&ctx, Job::Plan { req: 1, seq: good }) else {
+        panic!("planning should succeed")
+    };
+    let reply = engine::execute(
+        &ctx,
+        Job::Restore {
+            req: 2,
+            seq: good,
+            expect_tree: plan.current_tree.clone(),
+            pane: None,
+            notify: false,
+        },
+    );
+    // Put the directory back before any assertion can abort the test and leave
+    // a tempdir nobody can delete.
+    let _ = fs::set_permissions(&locked, std::os::unix::fs::PermissionsExt::from_mode(0o755));
+
+    match reply {
+        Reply::RestoreFailed { message, tree_moved, .. } => {
+            assert!(message.starts_with("the restore failed:"), "{message}");
+            assert!(
+                message.contains("Permission denied") || message.contains("locked"),
+                "{message}"
+            );
+            // `ops` re-applied the checkpoint, so the deletion it had already
+            // performed was undone — and the interface must not call that a
+            // tree between two states.
+            assert!(!tree_moved, "ops recovered, so nothing is uncertain: {message}");
+            assert!(message.contains("put back as they were"), "{message}");
+            assert!(
+                fixture.repo.join("extra.txt").exists(),
+                "the file the failed restore deleted should have been put back"
+            );
+        }
+        other => panic!("expected a failure reply, got {other:?}"),
+    }
+    assert!(
+        fixture.turns().iter().any(|t| t.kind == TurnKind::Checkpoint),
+        "the checkpoint taken before the attempt is the way back and must be on the timeline"
+    );
+}
+
+/// `--keys` runs before a single frame is drawn. `R` is the only key that
+/// writes, so it is the one key `--keys` must not carry — otherwise
+/// `sheep ui --rewind --select 1 --keys R --snapshot 80x20` rewrites a worktree
+/// with nothing ever shown to anyone, which is the whole premise inverted.
+#[test]
+fn scripted_keys_cannot_reach_a_write() {
+    let fixture = Fixture::new();
+    fixture.write("a.txt", "one\n");
+    fixture.write("b.txt", "keep me\n");
+    git(&fixture.repo, &["add", "-A"]);
+    git(&fixture.repo, &["commit", "--quiet", "-m", "init"]);
+    fixture.snap("claude", "first");
+    fixture.write("a.txt", "two\n");
+    fs::remove_file(fixture.repo.join("b.txt")).unwrap();
+    fixture.snap("claude", "second");
+
+    let ctx = fixture.ctx();
+    let mut app = App::new("repo", fixture.repo.display().to_string(), "default");
+    // Everything a caller could hand the scripted driver, aimed squarely at a
+    // restore: open the plan for turn #1, then press the key.
+    let args = UiArgs {
+        rewind: true,
+        no_notify: false,
+        select: Some("1".into()),
+        keys: Some("RRR".into()),
+        snapshot: Some("80x20".into()),
+    };
+    cli::settle(&ctx, &mut app, &args);
+
+    // The plan is on screen, which is the point of the driver.
+    match &app.plan {
+        PlanState::Ready(plan) => assert_eq!(plan.seq, 1),
+        other => panic!("expected the plan for #1, got {other:?}"),
+    }
+    // And nothing happened to the worktree.
+    assert_eq!(fs::read_to_string(fixture.repo.join("a.txt")).unwrap(), "two\n");
+    assert!(!fixture.repo.join("b.txt").exists(), "restoring #1 would have brought this back");
+    assert!(!app.restoring);
+    assert!(
+        fixture.turns().iter().all(|t| t.kind != TurnKind::Checkpoint),
+        "a scripted key must not have got as far as checkpointing"
+    );
+    assert_eq!(fixture.turns().len(), 2, "no turn was appended");
+}
+
+#[test]
+fn the_only_scripted_key_refused_is_the_one_that_writes() {
+    assert_eq!(cli::scripted_key('R'), None);
+    assert_eq!(cli::scripted_key('r'), Some(Key::Char('r')));
+    assert_eq!(cli::scripted_key('d'), Some(Key::Char('d')));
+    assert_eq!(cli::scripted_key('\r'), Some(Key::Enter));
+    assert_eq!(cli::scripted_key('\x1b'), Some(Key::Esc));
+}
+
+/// What a restore reports, in each of the four things that can happen to the
+/// write-back. This is the plugin's headline behaviour and the sentence a user
+/// reads to find out whether their agent knows what happened; only the
+/// "no pane" case was covered anywhere.
+#[test]
+fn a_restore_reports_the_way_back_and_what_the_agent_was_told() {
+    let outcome = |notice: Notice| sheep::tui::engine::Outcome {
+        seq: 7,
+        commit: "a1b2c3d4e5f6".repeat(3),
+        written: 6,
+        removed: 2,
+        checkpoint: Some(13),
+        notice,
+    };
+
+    let told = app::restored_lines(&outcome(Notice::Sent("w3K:p2".into()))).join(" | ");
+    assert!(told.contains("restored to #7 · 6 files written, 2 removed"), "{told}");
+    assert!(told.contains("turn #13"), "the way back has to be named: {told}");
+    assert!(told.contains("`sheep restore #13 --yes`"), "{told}");
+    assert!(told.contains("the agent in pane w3K:p2 was told what was taken back"), "{told}");
+
+    let off = app::restored_lines(&outcome(Notice::Off)).join(" | ");
+    assert!(off.contains("the agent was not told"), "{off}");
+    assert!(off.contains("press n"), "and how to turn it back on: {off}");
+
+    let skipped = app::restored_lines(&outcome(Notice::Skipped("not running inside herdr".into())))
+        .join(" | ");
+    assert!(skipped.contains("not told: not running inside herdr"), "{skipped}");
+
+    let failed =
+        app::restored_lines(&outcome(Notice::Failed("herdr api not_found: no such pane".into())))
+            .join(" | ");
+    assert!(failed.contains("could not tell the agent"), "{failed}");
+    assert!(failed.contains("no such pane"), "the reason has to survive: {failed}");
+
+    // A restore with nothing to checkpoint must not promise a way back.
+    let mut nothing = outcome(Notice::Off);
+    nothing.checkpoint = None;
+    let bare = app::restored_lines(&nothing).join(" | ");
+    assert!(!bare.contains("sheep restore #"), "{bare}");
+    assert!(bare.contains("nothing needed checkpointing"), "{bare}");
 }
 
 #[test]

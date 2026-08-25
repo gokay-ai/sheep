@@ -12,7 +12,7 @@
 use sheep::store::{Turn, TurnKind};
 use sheep::tui::app::{App, Key, Level, PlanState};
 use sheep::tui::engine::{Action, Job, Notice, Outcome, PlanView, Reply};
-use sheep::tui::runtime::{self, Input, Jobs, Screen, FINISH_GRACE_SECS};
+use sheep::tui::runtime::{self, Input, Jobs, Pumped, Screen, FINISH_GRACE_SECS};
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::rc::Rc;
@@ -107,6 +107,7 @@ impl Screen for Display {
 enum Answer {
     Stale(PlanView),
     Restored(Outcome),
+    Failed { message: String, tree_moved: bool },
 }
 
 /// A worker that records what it was asked to do and answers on cue.
@@ -122,12 +123,25 @@ struct BackendState {
     restore_req: Option<u64>,
     /// `(deliver once this many polls have happened, answer)`.
     script: VecDeque<(usize, Answer)>,
+    /// The poll at which the worker thread ends without answering.
+    dies_at: Option<usize>,
 }
 
 impl Backend {
     fn answering(script: Vec<(usize, Answer)>) -> Self {
         Self { inner: RefCell::new(BackendState { script: script.into(), ..Default::default() }) }
     }
+
+    /// A worker whose thread ends without answering — a panic inside `execute`,
+    /// which drops the sender.
+    fn dying_at(poll: usize) -> Self {
+        Self { inner: RefCell::new(BackendState { dies_at: Some(poll), ..Default::default() }) }
+    }
+
+    fn polls(&self) -> usize {
+        self.inner.borrow().polls
+    }
+
     fn restores(&self) -> usize {
         self.inner.borrow().sent.iter().filter(|j| matches!(j, Job::Restore { .. })).count()
     }
@@ -152,17 +166,24 @@ impl Jobs for Backend {
         }
         state.sent.push(job);
     }
-    fn try_recv(&self) -> Option<Reply> {
+    fn poll(&self) -> Pumped {
         let mut state = self.inner.borrow_mut();
         state.polls += 1;
+        if state.dies_at.is_some_and(|at| state.polls >= at) {
+            return Pumped::Gone;
+        }
         if state.script.front().is_none_or(|(at, _)| *at > state.polls) {
-            return None;
+            return Pumped::Idle;
         }
         let req = state.restore_req.expect("nothing asked for a restore yet");
-        state.script.pop_front().map(|(_, answer)| match answer {
-            Answer::Stale(plan) => Reply::Stale { req, plan },
-            Answer::Restored(outcome) => Reply::Restored { req, outcome },
-        })
+        match state.script.pop_front().map(|(_, answer)| answer) {
+            Some(Answer::Stale(plan)) => Pumped::Reply(Reply::Stale { req, plan }),
+            Some(Answer::Restored(outcome)) => Pumped::Reply(Reply::Restored { req, outcome }),
+            Some(Answer::Failed { message, tree_moved }) => {
+                Pumped::Reply(Reply::RestoreFailed { req, message, tree_moved })
+            }
+            None => Pumped::Idle,
+        }
     }
 }
 
@@ -388,6 +409,114 @@ fn an_ordinary_quit_returns_cleanly() {
     assert!(app.quit);
     assert_eq!(backend.restores(), 0);
     assert_eq!(keys.drains, 0, "nothing was restored, so there was no backlog to drop");
+}
+
+/// The mapping the loop depends on, at the one place it is made. Everything
+/// else here uses a fake worker, which cannot tell a dropped sender from a busy
+/// one — so without this, `Disconnected` could go back to reading as `Idle` and
+/// nothing would notice.
+#[test]
+fn a_worker_whose_thread_ended_polls_as_gone_not_idle() {
+    let (job_tx, job_rx) = std::sync::mpsc::channel::<Job>();
+    let (reply_tx, reply_rx) = std::sync::mpsc::channel::<Reply>();
+    let worker = Some(sheep::tui::engine::Worker::from_channels(job_tx, reply_rx));
+
+    assert!(matches!(worker.poll(), Pumped::Idle), "alive with nothing queued");
+    reply_tx.send(Reply::Turns(Vec::new())).unwrap();
+    assert!(matches!(worker.poll(), Pumped::Reply(_)));
+    assert!(matches!(worker.poll(), Pumped::Idle), "drained again");
+
+    drop(reply_tx); // the worker thread ended
+    assert!(
+        matches!(worker.poll(), Pumped::Gone),
+        "a worker that will never answer must not read as one that is merely busy"
+    );
+
+    // No worker at all is not a dead worker: nothing was ever expected.
+    assert!(matches!(None::<sheep::tui::engine::Worker>.poll(), Pumped::Idle));
+    drop(job_rx);
+}
+
+/// A worker whose thread ends is not a worker that is being slow. Before the
+/// loop could tell the difference, a restore it would never answer left the
+/// interface drawing "restoring…" for ever, and quitting cost the full grace
+/// period and then reported a worktree that may be half-restored — a guess,
+/// and often a false one.
+#[test]
+fn a_worker_that_dies_is_reported_at_once_rather_than_waited_out() {
+    let clock = Rc::new(Cell::new(1_000));
+    let mut app = ready();
+    let mut keys = Keyboard::typing("R", &clock);
+    let mut screen = Display::working();
+    let backend = Backend::dying_at(3);
+
+    let err = runtime::run(&mut app, &mut screen, &mut keys, &backend, &tick(&clock))
+        .expect_err("a worker that vanished has to be reported");
+
+    let text = format!("{err:#}");
+    assert!(text.contains("worker stopped while a restore was running"), "{text}");
+    assert!(text.contains("sheep log"), "the user has to be told what to check: {text}");
+    assert!(
+        !text.contains("may be half-restored"),
+        "that is the grace-period guess, not this: {text}"
+    );
+
+    assert!(!app.restoring, "the loop must stop waiting for a reply that is not coming");
+    assert!(
+        app.uncertain.is_some(),
+        "a worker that died mid-write leaves a tree nobody can vouch for"
+    );
+    assert!(
+        clock.get() - 1_000 < FINISH_GRACE_SECS,
+        "it should not have waited out the grace period (waited {})",
+        clock.get() - 1_000
+    );
+    assert!(backend.polls() < 20, "nor should it have spun: {} polls", backend.polls());
+}
+
+/// The same death with nothing in flight: the session is over, but there is
+/// nothing to be uncertain about.
+#[test]
+fn a_worker_that_dies_while_idle_says_so_without_alarming_anyone() {
+    let clock = Rc::new(Cell::new(1_000));
+    let mut app = ready();
+    let mut keys = Keyboard::typing("jj", &clock);
+    let mut screen = Display::working();
+    let backend = Backend::dying_at(2);
+
+    let err = runtime::run(&mut app, &mut screen, &mut keys, &backend, &tick(&clock)).unwrap_err();
+    let text = format!("{err:#}");
+    assert!(text.contains("worker stopped"), "{text}");
+    assert!(!text.contains("Whether anything was written"), "nothing was in flight: {text}");
+    assert!(app.uncertain.is_none(), "no write was running, so the tree is fine");
+}
+
+/// A restore that fails between `shadow::apply`'s deletions and its writes.
+/// `ops` puts the tree back and says so; the interface has to pass that on
+/// rather than assert its own version of events.
+#[test]
+fn a_failure_that_was_recovered_from_leaves_nothing_uncertain() {
+    let clock = Rc::new(Cell::new(1_000));
+    let mut app = ready();
+    let mut keys = Keyboard::typing("R", &clock);
+    let mut screen = Display::working();
+    let backend = Backend::answering(vec![(
+        3,
+        Answer::Failed {
+            message:
+                "the restore failed: cannot write src/a.ts. Your files were put back as they were."
+                    .into(),
+            tree_moved: false,
+        },
+    )]);
+
+    runtime::run(&mut app, &mut screen, &mut keys, &backend, &tick(&clock)).unwrap();
+
+    assert!(!app.restoring);
+    assert!(app.uncertain.is_none(), "the tree was put back, so nothing is uncertain");
+    let said = app.status.as_ref().unwrap().lines.join(" | ");
+    assert!(said.contains("your files are as they were"), "{said}");
+    assert!(said.contains("put back as they were"), "the operation's own words: {said}");
 }
 
 /// Finding 1, through the loop: the refusal screen the status line points at
