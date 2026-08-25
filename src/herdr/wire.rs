@@ -28,6 +28,20 @@ use std::os::unix::net::UnixStream;
 /// How long a single request may take before we give up on the server.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// The first `limit` characters of `text`, with an ellipsis when it was cut.
+///
+/// Slicing a `String` by byte index panics mid-character, and the places this
+/// is used exist *specifically* to show back a reply Sheep did not understand —
+/// which is exactly where a box-drawing character or an emoji turns a
+/// diagnostic into a crash that takes the recorder with it.
+pub fn clip(text: &str, limit: usize) -> String {
+    if text.chars().count() <= limit {
+        return text.to_string();
+    }
+    let head: String = text.chars().take(limit).collect();
+    format!("{head}\u{2026}")
+}
+
 /// Path to the running session's API socket, if we are inside one.
 pub fn socket_path() -> Option<PathBuf> {
     match std::env::var("HERDR_SOCKET_PATH") {
@@ -93,7 +107,7 @@ fn read_json(reader: &mut impl BufRead) -> Result<Option<Value>> {
         return Ok(Some(Value::Null));
     }
     Ok(Some(serde_json::from_str(trimmed).with_context(|| {
-        format!("herdr sent something that is not JSON: {}", &trimmed[..trimmed.len().min(200)])
+        format!("herdr sent something that is not JSON: {}", clip(trimmed, 200))
     })?))
 }
 

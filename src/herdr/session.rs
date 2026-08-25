@@ -120,7 +120,7 @@ impl Live {
 /// pane is gone. It has to be an error, so the corroboration waits and says so.
 fn malformed(method: &str, wanted: &str, got: &Value) -> anyhow::Error {
     let shown = got.to_string();
-    anyhow!("herdr answered {method} without `{wanted}`: {}", &shown[..shown.len().min(200)])
+    anyhow!("herdr answered {method} without `{wanted}`: {}", crate::herdr::wire::clip(&shown, 200))
 }
 
 impl Session for Live {
