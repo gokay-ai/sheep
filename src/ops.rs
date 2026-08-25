@@ -224,3 +224,114 @@ pub fn restore_expecting(
 pub fn short(oid: &str) -> &str {
     &oid[..12.min(oid.len())]
 }
+
+/// How much history a timeline keeps.
+#[derive(Debug, Clone, Copy)]
+pub struct Retention {
+    /// Newest turns to keep. The newest turn is always kept.
+    pub keep: usize,
+    /// Drop turns older than this many days, subject to `keep`.
+    pub max_age_days: Option<u64>,
+}
+
+impl Default for Retention {
+    fn default() -> Self {
+        // Enough to cover days of work at a realistic turn rate, small enough
+        // that a machine left running for a year does not accumulate a history
+        // nobody will ever scroll to.
+        Self { keep: 500, max_age_days: Some(30) }
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct Collected {
+    pub line: String,
+    pub kept: usize,
+    pub dropped: usize,
+    pub bytes_before: u64,
+    pub bytes_after: u64,
+}
+
+/// Shorten one timeline to what `policy` allows.
+///
+/// Trimming the turn log alone would free nothing: every old commit stays
+/// reachable through the parent chain. So the kept turns are rebuilt as a fresh
+/// chain — same trees, so every one of them still restores to the same bytes —
+/// and only then can the rest be collected.
+///
+/// `apply == false` reports what would happen and changes nothing.
+pub fn collect(
+    wt: &Worktree,
+    state: &Path,
+    line: &str,
+    policy: Retention,
+    apply: bool,
+) -> Result<Collected> {
+    let shadow = Shadow::ensure(wt.clone(), state)?;
+    let store = Store::open(state, &wt.id, line)?;
+    let turns = store.all()?;
+
+    let mut report = Collected {
+        line: line.to_string(),
+        bytes_before: shadow.size_bytes(),
+        ..Default::default()
+    };
+    if turns.is_empty() {
+        report.bytes_after = report.bytes_before;
+        return Ok(report);
+    }
+
+    let cutoff = policy
+        .max_age_days
+        .map(|days| shadow::now().saturating_sub(days.saturating_mul(86_400)));
+    let floor = turns.len().saturating_sub(policy.keep.max(1));
+
+    let kept: Vec<Turn> = turns
+        .iter()
+        .enumerate()
+        .filter(|(i, turn)| *i >= floor && cutoff.is_none_or(|c| turn.at >= c))
+        .map(|(_, turn)| turn.clone())
+        .collect();
+    // Never leave a timeline empty: an age policy that outruns every turn would
+    // otherwise delete a history the user can still see in the interface.
+    let mut kept = if kept.is_empty() { vec![turns[turns.len() - 1].clone()] } else { kept };
+
+    report.kept = kept.len();
+    report.dropped = turns.len() - kept.len();
+    if report.dropped == 0 || !apply {
+        report.bytes_after = report.bytes_before;
+        return Ok(report);
+    }
+
+    let chain: Vec<(String, String, u64)> =
+        kept.iter().map(|t| (t.tree.clone(), t.subject(), t.at)).collect();
+    let rewritten = shadow.rechain(line, &chain)?;
+
+    // The commit ids changed, so the log has to carry the new ones or a restore
+    // would look up a commit that is no longer reachable.
+    for (turn, commit) in kept.iter_mut().zip(rewritten.iter()) {
+        turn.parent = None;
+        turn.commit = commit.clone();
+    }
+    for i in 1..kept.len() {
+        kept[i].parent = Some(kept[i - 1].commit.clone());
+    }
+    store.rewrite(&kept)?;
+    shadow.collect()?;
+
+    report.bytes_after = shadow.size_bytes();
+    Ok(report)
+}
+
+/// Shorten every timeline recorded for `wt`.
+pub fn collect_all(
+    wt: &Worktree,
+    state: &Path,
+    policy: Retention,
+    apply: bool,
+) -> Result<Vec<Collected>> {
+    Store::lines_for(state, &wt.id)?
+        .into_iter()
+        .map(|line| collect(wt, state, &line, policy, apply))
+        .collect()
+}

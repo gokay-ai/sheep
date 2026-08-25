@@ -108,8 +108,87 @@ impl Store {
             .collect())
     }
 
+    /// The most recently appended turn, without reading the whole log.
+    ///
+    /// The recorder calls this on every snapshot and runs for days, so parsing
+    /// the entire timeline each time is quadratic over the life of the daemon.
+    /// The last record is almost always within the final few kilobytes, so read
+    /// backwards in blocks and only fall back to a full parse if the tail turns
+    /// out to hold nothing readable.
+    pub fn last(&self) -> Result<Option<Turn>> {
+        use std::io::{Read, Seek, SeekFrom};
+
+        let mut file = match std::fs::File::open(&self.path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e).with_context(|| format!("cannot read {}", self.path.display())),
+        };
+        let len = file.metadata()?.len();
+        if len == 0 {
+            return Ok(None);
+        }
+
+        const BLOCK: u64 = 8 * 1024;
+        let mut span = BLOCK.min(len);
+        loop {
+            file.seek(SeekFrom::Start(len - span))?;
+            let mut buf = vec![0u8; span as usize];
+            file.read_exact(&mut buf)?;
+            let text = String::from_utf8_lossy(&buf);
+
+            // Only trust a line we know is whole: unless we are at the start of
+            // the file, the first line in the block may be a fragment.
+            let complete = if span == len { text.as_ref() } else { text.split_once('\n').map_or("", |(_, rest)| rest) };
+            if let Some(turn) =
+                complete.lines().rev().filter_map(|l| serde_json::from_str::<Turn>(l).ok()).next()
+            {
+                return Ok(Some(turn));
+            }
+            if span == len {
+                return Ok(self.all()?.pop());
+            }
+            span = (span * 4).min(len);
+        }
+    }
+
     pub fn next_seq(&self) -> Result<u64> {
-        Ok(self.all()?.last().map(|t| t.seq + 1).unwrap_or(1))
+        Ok(self.last()?.map(|t| t.seq + 1).unwrap_or(1))
+    }
+
+    /// Replace the whole log. Written to a sibling and renamed, so an
+    /// interrupted prune leaves the previous timeline intact rather than half
+    /// a file.
+    pub fn rewrite(&self, turns: &[Turn]) -> Result<()> {
+        let tmp = self.path.with_extension("ndjson.tmp");
+        let mut body = String::new();
+        for turn in turns {
+            body.push_str(&serde_json::to_string(turn)?);
+            body.push('\n');
+        }
+        std::fs::write(&tmp, body).with_context(|| format!("cannot write {}", tmp.display()))?;
+        std::fs::rename(&tmp, &self.path)
+            .with_context(|| format!("cannot replace {}", self.path.display()))?;
+        Ok(())
+    }
+
+    /// Every timeline recorded for one worktree.
+    pub fn lines_for(state_dir: &Path, worktree_id: &str) -> Result<Vec<String>> {
+        let dir = state_dir.join("turns").join(worktree_id);
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(_) => return Ok(Vec::new()),
+        };
+        let mut lines: Vec<String> = entries
+            .flatten()
+            .filter_map(|e| {
+                let path = e.path();
+                (path.extension().and_then(|x| x.to_str()) == Some("ndjson"))
+                    .then(|| path.file_stem()?.to_str().map(str::to_string))
+                    .flatten()
+            })
+            .collect();
+        lines.sort();
+        Ok(lines)
     }
 
     pub fn append(&self, turn: &Turn) -> Result<()> {

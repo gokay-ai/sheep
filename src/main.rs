@@ -58,6 +58,24 @@ enum Command {
     },
     /// Report whether this worktree is safe for Sheep to record and restore.
     Doctor,
+    /// Shorten recorded history to what the retention policy allows.
+    ///
+    /// Dry run unless --yes is given. Rebuilds the kept turns as a fresh chain
+    /// so the dropped ones can actually be collected; every kept turn still
+    /// restores to exactly the same files.
+    Gc {
+        /// Newest turns to keep on each timeline.
+        #[arg(long, default_value_t = 500)]
+        keep: usize,
+        /// Also drop turns older than this many days. 0 disables the age rule.
+        #[arg(long, default_value_t = 30)]
+        max_age_days: u64,
+        /// Every timeline for this worktree, not just --line.
+        #[arg(long)]
+        all: bool,
+        #[arg(long)]
+        yes: bool,
+    },
     /// Watch the herdr session and record a turn whenever an agent finishes one.
     Watch(sheep::herdr::WatchArgs),
     /// Open Sheep's terminal interface: the timeline dock, or the rewind picker.
@@ -155,6 +173,32 @@ fn run() -> Result<()> {
             Ok(())
         }
 
+        Command::Gc { keep, max_age_days, all, yes } => {
+            let policy = ops::Retention {
+                keep: *keep,
+                max_age_days: (*max_age_days > 0).then_some(*max_age_days),
+            };
+            let reports = if *all {
+                ops::collect_all(&wt, &state, policy, *yes)?
+            } else {
+                vec![ops::collect(&wt, &state, line, policy, *yes)?]
+            };
+            let dropped: usize = reports.iter().map(|r| r.dropped).sum();
+            for r in &reports {
+                println!("{:<24} {} kept, {} dropped", r.line, r.kept, r.dropped);
+            }
+            if dropped == 0 {
+                println!("nothing to collect");
+            } else if *yes {
+                let before: u64 = reports.first().map(|r| r.bytes_before).unwrap_or(0);
+                let after: u64 = reports.last().map(|r| r.bytes_after).unwrap_or(0);
+                println!("\nshadow repository {} -> {}", human(before), human(after));
+            } else {
+                println!("\ndry run. re-run with --yes to apply.");
+            }
+            Ok(())
+        }
+
         Command::Watch(_) | Command::Ui(_) => unreachable!("handled above"),
     }
 }
@@ -179,6 +223,17 @@ fn doctor(wt: &Worktree, state: &Path, max_files: usize) -> Result<()> {
         }
         bail!("this worktree is not safe to record right now");
     }
+}
+
+fn human(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 { format!("{bytes} B") } else { format!("{value:.1} {}", UNITS[unit]) }
 }
 
 fn print_plan(plan: &RestorePlan, commit: &str) {

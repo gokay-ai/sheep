@@ -190,24 +190,81 @@ impl Shadow {
     pub fn commit(&self, line: &str, tree: &str, message: &str) -> Result<Snapshot> {
         let at = now();
         let parent = self.head(line)?;
+        let commit = self.commit_tree(tree, parent.as_deref(), message, at)?;
+        self.git().run(&["update-ref", &Self::ref_name(line), &commit])?;
+        Ok(Snapshot { commit, tree: tree.to_string(), parent, at })
+    }
+
+    /// Write a commit object. Author and committer are pinned so Sheep works on
+    /// a machine with no `user.email`, and the date is passed in so a rewritten
+    /// history keeps the times the turns actually happened.
+    fn commit_tree(&self, tree: &str, parent: Option<&str>, message: &str, at: u64) -> Result<String> {
         let mut args: Vec<String> = vec!["commit-tree".into(), tree.into()];
-        if let Some(p) = &parent {
+        if let Some(p) = parent {
             args.push("-p".into());
-            args.push(p.clone());
+            args.push(p.to_string());
         }
         args.push("-m".into());
         args.push(message.into());
         let argv: Vec<&str> = args.iter().map(String::as_str).collect();
 
         let date = format!("{at} +0000");
-        let commit = self
-            .git()
+        self.git()
             .with_env("GIT_AUTHOR_DATE", &date)
             .with_env("GIT_COMMITTER_DATE", &date)
-            .run(&argv)?;
+            .run(&argv)
+    }
 
-        self.git().run(&["update-ref", &Self::ref_name(line), &commit])?;
-        Ok(Snapshot { commit, tree: tree.to_string(), parent, at })
+    /// Rebuild a timeline from `turns` as a fresh parent chain and point the ref
+    /// at it, returning the new commit id for each turn in order.
+    ///
+    /// This is how history is actually shortened. Dropping entries from the turn
+    /// log alone frees nothing, because every old commit stays reachable through
+    /// the chain; the oldest kept turn has to become a root before anything
+    /// earlier can be collected. The trees are reused untouched, so every kept
+    /// turn restores to exactly the same bytes as before — only the commit ids
+    /// change, which is why the caller has to rewrite the log with them.
+    pub fn rechain(&self, line: &str, turns: &[(String, String, u64)]) -> Result<Vec<String>> {
+        let mut parent: Option<String> = None;
+        let mut written = Vec::with_capacity(turns.len());
+        for (tree, message, at) in turns {
+            let commit = self.commit_tree(tree, parent.as_deref(), message, *at)?;
+            parent = Some(commit.clone());
+            written.push(commit);
+        }
+        match parent {
+            Some(head) => self.git().run(&["update-ref", &Self::ref_name(line), &head])?,
+            None => self.git().run(&["update-ref", "-d", &Self::ref_name(line)])?,
+        };
+        Ok(written)
+    }
+
+    /// Drop everything no ref reaches any more.
+    ///
+    /// Only ever run against Sheep's own shadow repository — the git dir here is
+    /// never the user's. Borrowed objects live in the user's store and are not
+    /// touched by this.
+    pub fn collect(&self) -> Result<()> {
+        let git = Git::bare(&self.git_dir);
+        git.run(&["reflog", "expire", "--expire=now", "--all"])?;
+        git.run(&["gc", "--prune=now", "--quiet"])?;
+        Ok(())
+    }
+
+    /// Bytes the shadow repository occupies.
+    pub fn size_bytes(&self) -> u64 {
+        fn walk(dir: &Path) -> u64 {
+            let Ok(entries) = std::fs::read_dir(dir) else { return 0 };
+            entries
+                .flatten()
+                .map(|e| match e.metadata() {
+                    Ok(m) if m.is_dir() => walk(&e.path()),
+                    Ok(m) => m.len(),
+                    Err(_) => 0,
+                })
+                .sum()
+        }
+        walk(&self.git_dir)
     }
 
     /// The ref a timeline records onto.

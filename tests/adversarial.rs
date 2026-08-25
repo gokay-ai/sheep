@@ -717,3 +717,169 @@ fn a_restore_refuses_a_plan_the_tree_has_moved_out_from_under() {
     assert_eq!(f.read("a.txt"), "one\n");
     assert!(!f.exists("b.txt"));
 }
+
+// ---------------------------------------------------------------------------
+// Retention. A recorder that runs for days has to be able to forget, and the
+// only interesting question is whether forgetting damages what it keeps.
+// ---------------------------------------------------------------------------
+
+/// Record `n` turns, each changing one file, and return their sequence numbers.
+fn record_turns(f: &Fixture, line: &str, n: usize) -> Vec<u64> {
+    (0..n)
+        .map(|i| {
+            f.write("a.txt", &format!("revision {i}\n"));
+            f.write(&format!("only-in-{i}.txt"), "marker\n");
+            ops::snap(
+                &f.wt(),
+                &f.state,
+                line,
+                BUDGET,
+                TurnKind::Turn,
+                SnapMeta { note: Some(format!("turn {i}")), ..Default::default() },
+                false,
+            )
+            .unwrap()
+            .unwrap()
+            .seq
+        })
+        .collect()
+}
+
+#[test]
+fn a_kept_turn_still_restores_to_the_same_files_after_collection() {
+    // This is the only property that matters. Shortening history rebuilds the
+    // kept turns as a new chain, so their commit ids change; if the turn log
+    // and the trees do not travel together, a restore silently reaches for a
+    // commit that no longer exists — or worse, restores the wrong tree.
+    let f = Fixture::new();
+    f.write("a.txt", "base\n");
+    f.commit_all("base");
+    let seqs = record_turns(&f, "default", 8);
+    let keeper = *seqs.last().unwrap() - 2;
+
+    let before = ops::plan(&f.wt(), &f.state, "default", &keeper.to_string(), BUDGET).unwrap();
+    let expected_tree = before.shadow.tree_of(&before.commit).unwrap();
+
+    let report =
+        ops::collect(&f.wt(), &f.state, "default", ops::Retention { keep: 3, max_age_days: None }, true)
+            .unwrap();
+    assert_eq!(report.kept, 3);
+    assert_eq!(report.dropped, 5, "8 turns kept at 3 should drop 5");
+
+    let after = ops::plan(&f.wt(), &f.state, "default", &keeper.to_string(), BUDGET).unwrap();
+    assert_eq!(
+        after.shadow.tree_of(&after.commit).unwrap(),
+        expected_tree,
+        "a kept turn must point at the same tree after collection"
+    );
+
+    ops::restore(&f.wt(), &f.state, "default", &keeper.to_string(), BUDGET).unwrap();
+    assert_eq!(f.read("a.txt"), "revision 5\n");
+    assert!(f.exists("only-in-5.txt"));
+    assert!(!f.exists("only-in-7.txt"), "work after the kept turn must be gone");
+}
+
+#[test]
+fn a_dropped_turn_is_really_gone_and_its_space_with_it() {
+    let f = Fixture::new();
+    f.write("a.txt", "base\n");
+    f.commit_all("base");
+    let seqs = record_turns(&f, "default", 12);
+    let dropped = seqs[0];
+
+    let before = ops::collect(
+        &f.wt(),
+        &f.state,
+        "default",
+        ops::Retention { keep: 2, max_age_days: None },
+        false,
+    )
+    .unwrap();
+    assert_eq!(before.dropped, 10, "a dry run must still say what it would do");
+    assert_eq!(before.bytes_before, before.bytes_after, "a dry run must change nothing");
+    assert!(
+        ops::plan(&f.wt(), &f.state, "default", &dropped.to_string(), BUDGET).is_ok(),
+        "the dry run must not have removed anything"
+    );
+
+    let report = ops::collect(
+        &f.wt(),
+        &f.state,
+        "default",
+        ops::Retention { keep: 2, max_age_days: None },
+        true,
+    )
+    .unwrap();
+    assert_eq!(report.kept, 2);
+    assert!(
+        report.bytes_after < report.bytes_before,
+        "collection should reclaim space, went {} -> {}",
+        report.bytes_before,
+        report.bytes_after
+    );
+    assert!(
+        ops::plan(&f.wt(), &f.state, "default", &dropped.to_string(), BUDGET).is_err(),
+        "a dropped turn must no longer be reachable"
+    );
+}
+
+#[test]
+fn collection_never_leaves_a_timeline_empty() {
+    // An age policy that outruns every turn would otherwise delete a history
+    // the user can still see on screen.
+    let f = Fixture::new();
+    f.write("a.txt", "base\n");
+    f.commit_all("base");
+    record_turns(&f, "default", 3);
+
+    let report = ops::collect(
+        &f.wt(),
+        &f.state,
+        "default",
+        // Everything recorded a moment ago is "older than zero days".
+        ops::Retention { keep: 0, max_age_days: Some(0) },
+        true,
+    )
+    .unwrap();
+    assert_eq!(report.kept, 1, "the newest turn is always kept");
+
+    let turns = sheep::store::Store::open(&f.state, &f.wt().id, "default").unwrap().all().unwrap();
+    assert_eq!(turns.len(), 1);
+    ops::restore(&f.wt(), &f.state, "default", &turns[0].seq.to_string(), BUDGET).unwrap();
+}
+
+#[test]
+fn recording_continues_from_where_collection_left_off() {
+    let f = Fixture::new();
+    f.write("a.txt", "base\n");
+    f.commit_all("base");
+    let seqs = record_turns(&f, "default", 6);
+    let highest = *seqs.last().unwrap();
+
+    ops::collect(&f.wt(), &f.state, "default", ops::Retention { keep: 2, max_age_days: None }, true)
+        .unwrap();
+
+    f.write("a.txt", "after collection\n");
+    let next =
+        ops::snap(&f.wt(), &f.state, "default", BUDGET, TurnKind::Turn, SnapMeta::default(), false)
+            .unwrap()
+            .unwrap();
+    assert_eq!(next.seq, highest + 1, "turn numbers must not restart after collection");
+}
+
+#[test]
+fn the_last_turn_is_read_without_parsing_the_whole_log() {
+    // The recorder asks for this on every snapshot and runs for days; the
+    // interesting case is a log long enough that the tail read has to walk
+    // backwards past its first block.
+    let f = Fixture::new();
+    f.write("a.txt", "base\n");
+    f.commit_all("base");
+    let seqs = record_turns(&f, "default", 40);
+
+    let store = sheep::store::Store::open(&f.state, &f.wt().id, "default").unwrap();
+    let last = store.last().unwrap().expect("a recorded timeline has a last turn");
+    assert_eq!(last.seq, *seqs.last().unwrap());
+    assert_eq!(last.seq, store.all().unwrap().last().unwrap().seq, "the fast path must agree with the slow one");
+    assert_eq!(store.next_seq().unwrap(), last.seq + 1);
+}
