@@ -1,0 +1,240 @@
+# Sheep — undo for AI coding agents. The herdr adapter.
+#
+# This manifest sits in `herdr-plugin/` rather than the repository root on
+# purpose: the repo is a standalone tool that happens to ship a herdr plugin.
+# herdr treats the subdirectory as the plugin root, so the install line is
+#
+#     herdr plugin install <owner>/sheep/herdr-plugin
+#
+# Every path below is relative to THIS directory. herdr runs build, startup,
+# action and event commands with cwd = plugin root, so `install.sh` and
+# `scripts/*.sh` resolve without any path juggling. Panes are the exception —
+# see below.
+#
+# Two things shape the pane entries below (both verified against herdr 0.8):
+#   * a relative *program* in `[[panes]]` is resolved against the pane's own
+#     working directory, not the plugin root — and Sheep's panes are opened with
+#     `--cwd <the agent's worktree>`, so `./bin/sheep` resolves inside the user's
+#     repository and fails to spawn. herdr never shell-expands argv either, so a
+#     literal "$HERDR_PLUGIN_ROOT/bin/sheep" would be passed through verbatim.
+#     The fix is to launch a shell that IS on PATH and let it build the absolute
+#     path from HERDR_PLUGIN_ROOT, which herdr injects into every pane's
+#     environment. Same trick both platforms, `sh` on unix and `powershell` on
+#     Windows, which is also the only spelling that works on Windows at all.
+#   * action and pane ids must be unique across the whole manifest, platform
+#     gating included — hence the `-windows` suffixes.
+
+id = "sheep"
+name = "Sheep"
+version = "0.1.0"
+min_herdr_version = "0.8.0"
+description = "Undo for AI coding agents. Every agent turn becomes a restorable checkpoint."
+platforms = ["linux", "macos", "windows"]
+
+# --- install -----------------------------------------------------------------
+# Runs on `herdr plugin install`, before herdr registers the plugin. It must not
+# need cargo (herdr installs it for people who do not have Rust) and it must not
+# rewrite this file — herdr re-reads the manifest after the build and aborts the
+# install if it changed. `herdr plugin link` does NOT run build steps; local
+# development builds with `cargo build --release` and points `bin/` at that.
+
+[[build]]
+platforms = ["linux", "macos"]
+command = ["bash", "install.sh"]
+
+[[build]]
+platforms = ["windows"]
+command = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "install.ps1"]
+
+# --- the recorder ------------------------------------------------------------
+# herdr's startup hook is a one-shot: it spawns the command, captures its output
+# and counts it against a 32-command in-flight budget until it exits. A daemon
+# invoked directly would sit in that slot for the whole session, so `watchd`
+# starts `sheep watch` detached (setsid/nohup, or a detached process on Windows),
+# writes a pidfile under HERDR_PLUGIN_STATE_DIR and returns immediately. Running
+# it again while the recorder is alive is a no-op, which is what makes it safe to
+# reuse from the event hooks below.
+
+[[startup]]
+platforms = ["linux", "macos"]
+command = ["bash", "scripts/watchd.sh", "start"]
+
+[[startup]]
+platforms = ["windows"]
+command = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "scripts\\watchd.ps1", "start"]
+
+# --- panes -------------------------------------------------------------------
+# `dock` is the persistent timeline that lives beside the agent: a split, so it
+# takes a share of the layout and stays there.
+#
+# `rewind` is an overlay and deliberately NOT a popup. A popup is a modal
+# singleton: it has no pane_id, emits no pane lifecycle events, takes no part in
+# the layout or persistence APIs, and is gone after a session restore. Rewind is
+# a thing you interact with, walk away from, and come back to — it needs to be a
+# real pane.
+
+[[panes]]
+id = "dock"
+title = "Sheep"
+description = "The turn timeline for the agent beside it."
+platforms = ["linux", "macos"]
+placement = "split"
+command = ["sh", "-c", 'exec "${HERDR_PLUGIN_ROOT:?}/bin/sheep" ui']
+
+[[panes]]
+id = "dock-windows"
+title = "Sheep"
+description = "The turn timeline for the agent beside it."
+platforms = ["windows"]
+placement = "split"
+command = [
+  "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
+  "& (Join-Path $env:HERDR_PLUGIN_ROOT 'bin\\sheep.exe') ui",
+]
+
+[[panes]]
+id = "rewind"
+title = "Sheep · rewind"
+description = "Pick a turn, read the plan, go back."
+platforms = ["linux", "macos"]
+placement = "overlay"
+command = ["sh", "-c", 'exec "${HERDR_PLUGIN_ROOT:?}/bin/sheep" ui --rewind']
+
+[[panes]]
+id = "rewind-windows"
+title = "Sheep · rewind"
+description = "Pick a turn, read the plan, go back."
+platforms = ["windows"]
+placement = "overlay"
+command = [
+  "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
+  "& (Join-Path $env:HERDR_PLUGIN_ROOT 'bin\\sheep.exe') ui --rewind",
+]
+
+# --- actions -----------------------------------------------------------------
+# `contexts` picks where herdr offers the action. All four want to know which
+# agent they are acting on, so they are offered on a pane and on a workspace
+# (which resolves to its focused pane); none of them make sense with nothing
+# focused, so none declares `global`.
+
+[[actions]]
+id = "rewind"
+title = "Rewind this agent"
+description = "Open the rewind overlay for the focused agent's timeline."
+contexts = ["pane", "workspace"]
+platforms = ["linux", "macos"]
+command = ["bash", "scripts/open-pane.sh", "rewind"]
+
+[[actions]]
+id = "rewind-windows"
+title = "Rewind this agent"
+description = "Open the rewind overlay for the focused agent's timeline."
+contexts = ["pane", "workspace"]
+platforms = ["windows"]
+command = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "scripts\\open-pane.ps1", "rewind"]
+
+[[actions]]
+id = "dock"
+title = "Show the Sheep timeline"
+description = "Split the timeline dock in beside the focused agent."
+contexts = ["pane", "workspace"]
+platforms = ["linux", "macos"]
+command = ["bash", "scripts/open-pane.sh", "dock"]
+
+[[actions]]
+id = "dock-windows"
+title = "Show the Sheep timeline"
+description = "Split the timeline dock in beside the focused agent."
+contexts = ["pane", "workspace"]
+platforms = ["windows"]
+command = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "scripts\\open-pane.ps1", "dock"]
+
+[[actions]]
+id = "snap"
+title = "Snapshot this worktree now"
+description = "Record the focused agent's working tree as a turn, out of band."
+contexts = ["pane", "workspace"]
+platforms = ["linux", "macos"]
+command = ["bash", "scripts/sheep-run.sh", "snap"]
+
+[[actions]]
+id = "snap-windows"
+title = "Snapshot this worktree now"
+description = "Record the focused agent's working tree as a turn, out of band."
+contexts = ["pane", "workspace"]
+platforms = ["windows"]
+command = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "scripts\\sheep-run.ps1", "snap"]
+
+[[actions]]
+id = "doctor"
+title = "Can Sheep record here?"
+description = "Report whether the focused agent's worktree is safe to record and restore."
+contexts = ["pane", "workspace"]
+platforms = ["linux", "macos"]
+command = ["bash", "scripts/sheep-run.sh", "doctor"]
+
+[[actions]]
+id = "doctor-windows"
+title = "Can Sheep record here?"
+description = "Report whether the focused agent's worktree is safe to record and restore."
+contexts = ["pane", "workspace"]
+platforms = ["windows"]
+command = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "scripts\\sheep-run.ps1", "doctor"]
+
+# --- events ------------------------------------------------------------------
+# Both hooks re-run `watchd start`, which is a no-op when the recorder is alive.
+#
+# The obvious reading of "hook worktree.created" is "open the dock in the new
+# worktree", and that is the wrong thing to do. A new worktree is created *for*
+# an agent that is about to start working; spawning a pane into it takes a share
+# of a layout the user has not looked at yet, and a plugin that rearranges your
+# screen uninvited gets uninstalled. What must not be missed is the RECORDING —
+# a turn that happens while the recorder is down is gone for good. So these
+# hooks heal the recorder (a background daemon that can steal nothing) and leave
+# the dock to `prefix+Z`, which is one keystroke away and asked for.
+#
+# `worktree.created` fires when herdr cuts a new worktree for an agent — the
+# exact moment a new timeline starts existing. `workspace.created` covers the
+# session-restore path and plain new workspaces, and is the cheapest place to
+# notice that a previous `sheep watch` died with its session.
+
+[[events]]
+on = "worktree.created"
+platforms = ["linux", "macos"]
+command = ["bash", "scripts/watchd.sh", "start"]
+
+[[events]]
+on = "worktree.created"
+platforms = ["windows"]
+command = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "scripts\\watchd.ps1", "start"]
+
+[[events]]
+on = "workspace.created"
+platforms = ["linux", "macos"]
+command = ["bash", "scripts/watchd.sh", "start"]
+
+[[events]]
+on = "workspace.created"
+platforms = ["windows"]
+command = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "scripts\\watchd.ps1", "start"]
+
+# --- keybindings -------------------------------------------------------------
+# Declared here because the plugin brief and herdr's plugin documentation both
+# put `[[keys.command]]` in this file. Be aware of the drift: herdr 0.8 reads
+# keybindings from the user's `config.toml` only (`src/config/keybinds.rs`); the
+# manifest loader has no `keys` field and ignores unknown tables, so these two
+# entries are accepted but inert. `keybindings.toml` next to this file is the
+# same two bindings ready to paste into `~/.config/herdr/config.toml`; the
+# platform-suffixed action ids are listed there too.
+
+[[keys.command]]
+key = "prefix+z"
+type = "plugin_action"
+command = "sheep.rewind"
+description = "rewind this agent"
+
+[[keys.command]]
+key = "prefix+Z"
+type = "plugin_action"
+command = "sheep.dock"
+description = "show the Sheep timeline"
