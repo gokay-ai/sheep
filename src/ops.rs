@@ -140,6 +140,45 @@ impl std::fmt::Display for StaleTree {
 
 impl std::error::Error for StaleTree {}
 
+/// A restore failed partway through.
+///
+/// [`Shadow::apply`] removes before it writes, and it has to: a path that
+/// changes between a file and a directory cannot be written while the old shape
+/// is still there. So a failure in the middle leaves a tree that is neither
+/// state, and the only honest thing to do is say so — and try to undo it.
+///
+/// `recovered` is the difference between "your files are as they were" and
+/// "your files are between two states, here is how to get back".
+#[derive(Debug)]
+pub struct RestoreFailed {
+    pub recovered: bool,
+    /// The checkpoint holding the state from before the attempt, when one was
+    /// taken. Restoring it is the way back.
+    pub checkpoint_seq: Option<u64>,
+    pub cause: String,
+    /// Set when putting the tree back failed as well.
+    pub recovery_error: Option<String>,
+}
+
+impl std::fmt::Display for RestoreFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the restore failed: {}", self.cause)?;
+        if self.recovered {
+            return write!(f, ". Your files were put back as they were.");
+        }
+        write!(f, ". Your working tree is between two states")?;
+        if let Some(err) = &self.recovery_error {
+            write!(f, ", and putting it back failed too ({err})")?;
+        }
+        match self.checkpoint_seq {
+            Some(seq) => write!(f, " — `sheep restore #{seq} --yes` returns it to how it was."),
+            None => write!(f, "."),
+        }
+    }
+}
+
+impl std::error::Error for RestoreFailed {}
+
 #[derive(Debug)]
 pub struct Restored {
     pub plan: RestorePlan,
@@ -205,7 +244,25 @@ pub fn restore_expecting(
         true,
     )?;
 
-    shadow.apply(&plan)?;
+    if let Err(cause) = shadow.apply(&plan) {
+        // The checkpoint tree is exactly what was on disk a moment ago, so a
+        // plan from here to there is precisely the repair. Attempt it before
+        // reporting anything: a user should have to think about a half-applied
+        // tree only when we genuinely could not undo it.
+        let mut failure = RestoreFailed {
+            recovered: false,
+            checkpoint_seq: checkpoint.as_ref().map(|c| c.seq),
+            cause: format!("{cause:#}"),
+            recovery_error: None,
+        };
+        if let Some(cp) = &checkpoint {
+            match shadow.plan(&cp.tree).and_then(|back| shadow.apply(&back)) {
+                Ok(()) => failure.recovered = true,
+                Err(e) => failure.recovery_error = Some(format!("{e:#}")),
+            }
+        }
+        return Err(failure.into());
+    }
 
     // Record where we landed, so the timeline always describes what is on disk.
     snap(
@@ -223,4 +280,115 @@ pub fn restore_expecting(
 
 pub fn short(oid: &str) -> &str {
     &oid[..12.min(oid.len())]
+}
+
+/// How much history a timeline keeps.
+#[derive(Debug, Clone, Copy)]
+pub struct Retention {
+    /// Newest turns to keep. The newest turn is always kept.
+    pub keep: usize,
+    /// Drop turns older than this many days, subject to `keep`.
+    pub max_age_days: Option<u64>,
+}
+
+impl Default for Retention {
+    fn default() -> Self {
+        // Enough to cover days of work at a realistic turn rate, small enough
+        // that a machine left running for a year does not accumulate a history
+        // nobody will ever scroll to.
+        Self { keep: 500, max_age_days: Some(30) }
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct Collected {
+    pub line: String,
+    pub kept: usize,
+    pub dropped: usize,
+    pub bytes_before: u64,
+    pub bytes_after: u64,
+}
+
+/// Shorten one timeline to what `policy` allows.
+///
+/// Trimming the turn log alone would free nothing: every old commit stays
+/// reachable through the parent chain. So the kept turns are rebuilt as a fresh
+/// chain — same trees, so every one of them still restores to the same bytes —
+/// and only then can the rest be collected.
+///
+/// `apply == false` reports what would happen and changes nothing.
+pub fn collect(
+    wt: &Worktree,
+    state: &Path,
+    line: &str,
+    policy: Retention,
+    apply: bool,
+) -> Result<Collected> {
+    let shadow = Shadow::ensure(wt.clone(), state)?;
+    let store = Store::open(state, &wt.id, line)?;
+    let turns = store.all()?;
+
+    let mut report = Collected {
+        line: line.to_string(),
+        bytes_before: shadow.size_bytes(),
+        ..Default::default()
+    };
+    if turns.is_empty() {
+        report.bytes_after = report.bytes_before;
+        return Ok(report);
+    }
+
+    let cutoff = policy
+        .max_age_days
+        .map(|days| shadow::now().saturating_sub(days.saturating_mul(86_400)));
+    let floor = turns.len().saturating_sub(policy.keep.max(1));
+
+    let kept: Vec<Turn> = turns
+        .iter()
+        .enumerate()
+        .filter(|(i, turn)| *i >= floor && cutoff.is_none_or(|c| turn.at >= c))
+        .map(|(_, turn)| turn.clone())
+        .collect();
+    // Never leave a timeline empty: an age policy that outruns every turn would
+    // otherwise delete a history the user can still see in the interface.
+    let mut kept = if kept.is_empty() { vec![turns[turns.len() - 1].clone()] } else { kept };
+
+    report.kept = kept.len();
+    report.dropped = turns.len() - kept.len();
+    if report.dropped == 0 || !apply {
+        report.bytes_after = report.bytes_before;
+        return Ok(report);
+    }
+
+    let chain: Vec<(String, String, u64)> =
+        kept.iter().map(|t| (t.tree.clone(), t.subject(), t.at)).collect();
+    let rewritten = shadow.rechain(line, &chain)?;
+
+    // The commit ids changed, so the log has to carry the new ones or a restore
+    // would look up a commit that is no longer reachable.
+    for (turn, commit) in kept.iter_mut().zip(rewritten.iter()) {
+        turn.parent = None;
+        turn.commit = commit.clone();
+    }
+    for i in 1..kept.len() {
+        kept[i].parent = Some(kept[i - 1].commit.clone());
+    }
+    store.rewrite(&kept)?;
+    shadow.collect()?;
+
+    report.bytes_after = shadow.size_bytes();
+    Ok(report)
+}
+
+/// Shorten every timeline recorded for `wt`.
+pub fn collect_all(
+    wt: &Worktree,
+    state: &Path,
+    policy: Retention,
+    apply: bool,
+) -> Result<Vec<Collected>> {
+    Store::lines_for(state, &wt.id)?
+        .into_iter()
+        .map(|line| collect(wt, state, &line, policy, apply))
+        .collect()
 }

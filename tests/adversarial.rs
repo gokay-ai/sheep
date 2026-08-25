@@ -717,3 +717,297 @@ fn a_restore_refuses_a_plan_the_tree_has_moved_out_from_under() {
     assert_eq!(f.read("a.txt"), "one\n");
     assert!(!f.exists("b.txt"));
 }
+
+// ---------------------------------------------------------------------------
+// Retention. A recorder that runs for days has to be able to forget, and the
+// only interesting question is whether forgetting damages what it keeps.
+// ---------------------------------------------------------------------------
+
+/// Record `n` turns, each changing one file, and return their sequence numbers.
+fn record_turns(f: &Fixture, line: &str, n: usize) -> Vec<u64> {
+    (0..n)
+        .map(|i| {
+            f.write("a.txt", &format!("revision {i}\n"));
+            f.write(&format!("only-in-{i}.txt"), "marker\n");
+            ops::snap(
+                &f.wt(),
+                &f.state,
+                line,
+                BUDGET,
+                TurnKind::Turn,
+                SnapMeta { note: Some(format!("turn {i}")), ..Default::default() },
+                false,
+            )
+            .unwrap()
+            .unwrap()
+            .seq
+        })
+        .collect()
+}
+
+#[test]
+fn a_kept_turn_still_restores_to_the_same_files_after_collection() {
+    // This is the only property that matters. Shortening history rebuilds the
+    // kept turns as a new chain, so their commit ids change; if the turn log
+    // and the trees do not travel together, a restore silently reaches for a
+    // commit that no longer exists — or worse, restores the wrong tree.
+    let f = Fixture::new();
+    f.write("a.txt", "base\n");
+    f.commit_all("base");
+    let seqs = record_turns(&f, "default", 8);
+    let keeper = *seqs.last().unwrap() - 2;
+
+    let before = ops::plan(&f.wt(), &f.state, "default", &keeper.to_string(), BUDGET).unwrap();
+    let expected_tree = before.shadow.tree_of(&before.commit).unwrap();
+
+    let report =
+        ops::collect(&f.wt(), &f.state, "default", ops::Retention { keep: 3, max_age_days: None }, true)
+            .unwrap();
+    assert_eq!(report.kept, 3);
+    assert_eq!(report.dropped, 5, "8 turns kept at 3 should drop 5");
+
+    let after = ops::plan(&f.wt(), &f.state, "default", &keeper.to_string(), BUDGET).unwrap();
+    assert_eq!(
+        after.shadow.tree_of(&after.commit).unwrap(),
+        expected_tree,
+        "a kept turn must point at the same tree after collection"
+    );
+
+    ops::restore(&f.wt(), &f.state, "default", &keeper.to_string(), BUDGET).unwrap();
+    assert_eq!(f.read("a.txt"), "revision 5\n");
+    assert!(f.exists("only-in-5.txt"));
+    assert!(!f.exists("only-in-7.txt"), "work after the kept turn must be gone");
+}
+
+#[test]
+fn a_dropped_turn_is_really_gone_and_its_space_with_it() {
+    let f = Fixture::new();
+    f.write("a.txt", "base\n");
+    f.commit_all("base");
+    let seqs = record_turns(&f, "default", 12);
+    let dropped = seqs[0];
+
+    let before = ops::collect(
+        &f.wt(),
+        &f.state,
+        "default",
+        ops::Retention { keep: 2, max_age_days: None },
+        false,
+    )
+    .unwrap();
+    assert_eq!(before.dropped, 10, "a dry run must still say what it would do");
+    assert_eq!(before.bytes_before, before.bytes_after, "a dry run must change nothing");
+    assert!(
+        ops::plan(&f.wt(), &f.state, "default", &dropped.to_string(), BUDGET).is_ok(),
+        "the dry run must not have removed anything"
+    );
+
+    let report = ops::collect(
+        &f.wt(),
+        &f.state,
+        "default",
+        ops::Retention { keep: 2, max_age_days: None },
+        true,
+    )
+    .unwrap();
+    assert_eq!(report.kept, 2);
+    assert!(
+        report.bytes_after < report.bytes_before,
+        "collection should reclaim space, went {} -> {}",
+        report.bytes_before,
+        report.bytes_after
+    );
+    assert!(
+        ops::plan(&f.wt(), &f.state, "default", &dropped.to_string(), BUDGET).is_err(),
+        "a dropped turn must no longer be reachable"
+    );
+}
+
+#[test]
+fn collection_never_leaves_a_timeline_empty() {
+    // An age policy that outruns every turn would otherwise delete a history
+    // the user can still see on screen.
+    let f = Fixture::new();
+    f.write("a.txt", "base\n");
+    f.commit_all("base");
+    record_turns(&f, "default", 3);
+
+    let report = ops::collect(
+        &f.wt(),
+        &f.state,
+        "default",
+        // Everything recorded a moment ago is "older than zero days".
+        ops::Retention { keep: 0, max_age_days: Some(0) },
+        true,
+    )
+    .unwrap();
+    assert_eq!(report.kept, 1, "the newest turn is always kept");
+
+    let turns = sheep::store::Store::open(&f.state, &f.wt().id, "default").unwrap().all().unwrap();
+    assert_eq!(turns.len(), 1);
+    ops::restore(&f.wt(), &f.state, "default", &turns[0].seq.to_string(), BUDGET).unwrap();
+}
+
+#[test]
+fn recording_continues_from_where_collection_left_off() {
+    let f = Fixture::new();
+    f.write("a.txt", "base\n");
+    f.commit_all("base");
+    let seqs = record_turns(&f, "default", 6);
+    let highest = *seqs.last().unwrap();
+
+    ops::collect(&f.wt(), &f.state, "default", ops::Retention { keep: 2, max_age_days: None }, true)
+        .unwrap();
+
+    f.write("a.txt", "after collection\n");
+    let next =
+        ops::snap(&f.wt(), &f.state, "default", BUDGET, TurnKind::Turn, SnapMeta::default(), false)
+            .unwrap()
+            .unwrap();
+    assert_eq!(next.seq, highest + 1, "turn numbers must not restart after collection");
+}
+
+#[test]
+fn the_last_turn_is_read_without_parsing_the_whole_log() {
+    // The recorder asks for this on every snapshot and runs for days; the
+    // interesting case is a log long enough that the tail read has to walk
+    // backwards past its first block.
+    let f = Fixture::new();
+    f.write("a.txt", "base\n");
+    f.commit_all("base");
+    let seqs = record_turns(&f, "default", 40);
+
+    let store = sheep::store::Store::open(&f.state, &f.wt().id, "default").unwrap();
+    let last = store.last().unwrap().expect("a recorded timeline has a last turn");
+    assert_eq!(last.seq, *seqs.last().unwrap());
+    assert_eq!(last.seq, store.all().unwrap().last().unwrap().seq, "the fast path must agree with the slow one");
+    assert_eq!(store.next_seq().unwrap(), last.seq + 1);
+}
+
+#[test]
+fn a_nested_repository_is_never_deleted_by_a_restore() {
+    // Found by a security audit, and the worst bug in the project's history.
+    //
+    // `git add -A` records a repository inside the worktree as one gitlink — a
+    // commit pointer, nothing else. So restoring to a turn taken before that
+    // repository existed produced a one-line plan, `remove vendor`, which the
+    // apply step resolved to a directory and deleted whole. Nothing inside it
+    // was in any snapshot, so the checkpoint taken beforehand restored an empty
+    // directory and the work was gone for good: the repository's own history,
+    // its uncommitted files, and its ignored files.
+    let f = Fixture::new();
+    f.write("a.txt", "one\n");
+    f.commit_all("base");
+    let before_vendor = f.snap("before the nested repository existed");
+
+    let vendor = f.repo.join("vendor");
+    fs::create_dir_all(&vendor).unwrap();
+    git(&vendor, &["init", "--quiet", "-b", "main"]);
+    fs::write(vendor.join("uncommitted.txt"), "work nobody else has\n").unwrap();
+    fs::write(vendor.join(".env"), "SECRET=hunter2\n").unwrap();
+    fs::write(vendor.join(".gitignore"), ".env\n").unwrap();
+    fs::write(vendor.join("tracked.txt"), "committed inside vendor\n").unwrap();
+    git(&vendor, &["add", "-A"]);
+    git(&vendor, &["commit", "--quiet", "-m", "vendor base"]);
+    f.snap("the nested repository exists now");
+
+    // It must be visible before anything happens, not discovered afterwards.
+    let health = repo::inspect(&f.wt(), BUDGET).unwrap();
+    assert!(
+        health.warnings.iter().any(|w| matches!(w, Warning::NestedRepositories(paths) if paths.iter().any(|p| p == "vendor"))),
+        "a nested repository must be surfaced by doctor: {:?}",
+        health.warnings
+    );
+
+    let planned =
+        ops::plan(&f.wt(), &f.state, "default", &before_vendor.to_string(), BUDGET).unwrap();
+    assert_eq!(planned.plan.remove, vec!["vendor".to_string()], "the plan is one line, and that is the trap");
+
+    let err = ops::restore(&f.wt(), &f.state, "default", &before_vendor.to_string(), BUDGET)
+        .expect_err("removing a directory Sheep never captured must be refused");
+    assert!(err.to_string().contains("vendor"), "the refusal should name it: {err}");
+
+    // Everything survives, including the parts no snapshot could ever hold.
+    assert!(vendor.join(".git").is_dir(), "the nested repository's history must survive");
+    assert_eq!(fs::read_to_string(vendor.join("uncommitted.txt")).unwrap(), "work nobody else has\n");
+    assert_eq!(fs::read_to_string(vendor.join(".env")).unwrap(), "SECRET=hunter2\n");
+    assert_eq!(fs::read_to_string(vendor.join("tracked.txt")).unwrap(), "committed inside vendor\n");
+    assert_eq!(f.read("a.txt"), "one\n", "and the refusal happens before anything else is touched");
+}
+
+#[test]
+fn a_path_that_became_a_directory_under_the_plan_is_refused() {
+    // The same guard from the other direction: between planning and applying,
+    // a file the plan means to remove turns into a directory. Deleting it would
+    // take contents the plan never described.
+    let f = Fixture::new();
+    f.write("a.txt", "one\n");
+    f.commit_all("base");
+    let target = f.snap("turn 1");
+    f.write("later.txt", "added by the agent\n");
+    f.snap("turn 2");
+
+    let planned = ops::plan(&f.wt(), &f.state, "default", &target.to_string(), BUDGET).unwrap();
+    assert_eq!(planned.plan.remove, vec!["later.txt".to_string()]);
+
+    fs::remove_file(f.repo.join("later.txt")).unwrap();
+    f.write("later.txt/surprise.txt", "written after the plan was made\n");
+
+    let err = planned.shadow.apply(&planned.plan).expect_err("a directory must not be removed");
+    assert!(err.to_string().contains("later.txt"), "the refusal should name it: {err}");
+    assert!(f.exists("later.txt/surprise.txt"), "its contents must survive");
+}
+
+#[test]
+fn a_restore_that_fails_partway_puts_the_tree_back() {
+    // `apply` removes before it writes, and it has to — a path changing between
+    // a file and a directory cannot be written while the old shape is there. So
+    // a failure in the middle leaves a tree that is neither state. Claiming
+    // "nothing was written" at that point is the most dangerous thing the
+    // software could say, so it recovers first and tells the truth either way.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let f = Fixture::new();
+        f.write("keep/x.txt", "original\n");
+        f.write("gone.txt", "here at the target\n");
+        f.commit_all("base");
+        let target = f.snap("turn 1");
+
+        fs::remove_file(f.repo.join("gone.txt")).unwrap();
+        f.write("keep/x.txt", "the agent changed this\n");
+        f.snap("turn 2");
+
+        // The plan writes into keep/ and removes nothing outside it; making the
+        // directory read-only fails the write after the removals have run.
+        let locked = f.repo.join("keep");
+        let original = fs::metadata(&locked).unwrap().permissions();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o555)).unwrap();
+
+        let err = ops::restore(&f.wt(), &f.state, "default", &target.to_string(), BUDGET)
+            .expect_err("a write into a read-only directory must fail");
+
+        fs::set_permissions(&locked, original).unwrap();
+
+        let failed = err
+            .downcast_ref::<ops::RestoreFailed>()
+            .unwrap_or_else(|| panic!("a partial restore must be reported as one: {err:#}"));
+        assert!(
+            failed.recovered,
+            "the tree should have been put back; instead: {}",
+            err
+        );
+        assert!(
+            failed.checkpoint_seq.is_some(),
+            "the way back has to be nameable even when recovery worked"
+        );
+
+        // The agent's work is exactly as it was before the attempt.
+        assert_eq!(f.read("keep/x.txt"), "the agent changed this\n");
+        assert!(!f.exists("gone.txt"), "a file the restore had removed must be back to absent");
+        assert!(
+            !err.to_string().contains("nothing was written"),
+            "the message must never claim nothing happened: {err}"
+        );
+    }
+}
