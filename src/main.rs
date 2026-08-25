@@ -164,6 +164,9 @@ fn run() -> Result<()> {
             }
             let done = ops::restore(&wt, &state, line, target, cli.max_files)?;
             println!("\nrestored {} path(s).", done.plan.touched());
+            if let Some(note) = &done.bookkeeping_error {
+                println!("note: your files are restored, but recording the new turn failed ({note}).");
+            }
             if let Some(cp) = done.checkpoint {
                 println!(
                     "previous state kept as turn #{} — `sheep restore #{}` puts it back.",

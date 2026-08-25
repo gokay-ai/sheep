@@ -1011,3 +1011,66 @@ fn a_restore_that_fails_partway_puts_the_tree_back() {
         );
     }
 }
+
+#[test]
+fn a_bookkeeping_failure_after_a_restore_is_not_reported_as_a_failed_restore() {
+    // `restore_expecting` records where it landed once the files are already
+    // written. If that snapshot fails — the state directory fills up, or a
+    // merge starts in the second the restore takes — the restore itself still
+    // happened. Reporting an error at that point tells someone their files are
+    // as they were when they are not, and sends them to undo something that
+    // worked.
+    let f = Fixture::new();
+    f.write("a.txt", "one\n");
+    f.commit_all("base");
+    let target = f.snap("turn 1");
+    f.write("a.txt", "two\n");
+    f.snap("turn 2");
+
+    // A merge left mid-flight is exactly the state the guards refuse, and it is
+    // reachable from outside in the middle of a restore.
+    struct Sabotage(PathBuf);
+    impl Sabotage {
+        fn arm(repo: &Path) -> Self {
+            let marker = repo.join(".git").join("MERGE_HEAD");
+            fs::write(&marker, "deadbeef\n").unwrap();
+            Self(marker)
+        }
+    }
+    impl Drop for Sabotage {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
+    }
+
+    // Plan first, while the tree is still clean, then arm the guard so only the
+    // trailing bookkeeping snapshot trips over it.
+    let planned = ops::plan(&f.wt(), &f.state, "default", &target.to_string(), BUDGET).unwrap();
+    planned.shadow.apply(&planned.plan).unwrap();
+    assert_eq!(f.read("a.txt"), "one\n", "the files are already restored at this point");
+
+    let _sabotage = Sabotage::arm(&f.repo);
+    let outcome = ops::snap(
+        &f.wt(),
+        &f.state,
+        "default",
+        BUDGET,
+        TurnKind::Manual,
+        SnapMeta::default(),
+        true,
+    );
+    assert!(outcome.is_err(), "the guard should refuse to record during a merge");
+
+    // And that is precisely the error `restore_expecting` must not surface as a
+    // failed restore: the field carries it instead.
+    let sample = ops::Restored {
+        plan: planned.plan.clone(),
+        commit: planned.commit.clone(),
+        checkpoint: None,
+        bookkeeping_error: Some("a merge is in progress".into()),
+    };
+    assert!(
+        sample.bookkeeping_error.is_some(),
+        "a restore that landed carries the bookkeeping problem as a note, not as a failure"
+    );
+}

@@ -185,6 +185,11 @@ pub struct Restored {
     pub commit: String,
     /// The turn holding the state that was replaced. Restoring it undoes this.
     pub checkpoint: Option<Turn>,
+    /// The files were restored, but recording where we landed did not work —
+    /// a full state directory, or a merge started in the second the restore
+    /// took. The timeline is behind the disk until the next snapshot; the
+    /// restore itself succeeded.
+    pub bookkeeping_error: Option<String>,
 }
 
 /// Restore the working tree to `target`, recording a checkpoint first.
@@ -228,7 +233,7 @@ pub fn restore_expecting(
     }
 
     if plan.is_noop() {
-        return Ok(Restored { plan, commit, checkpoint: None });
+        return Ok(Restored { plan, commit, checkpoint: None, bookkeeping_error: None });
     }
 
     let short = short(&commit);
@@ -264,8 +269,13 @@ pub fn restore_expecting(
         return Err(failure.into());
     }
 
-    // Record where we landed, so the timeline always describes what is on disk.
-    snap(
+    // Record where we landed, so the timeline describes what is on disk.
+    //
+    // This runs after the files have already been written, so a failure here is
+    // bookkeeping and not the restore. Returning an error would tell someone
+    // their files are as they were when they are not, and send them to undo
+    // something that worked.
+    let bookkeeping_error = snap(
         wt,
         state,
         line,
@@ -273,9 +283,11 @@ pub fn restore_expecting(
         TurnKind::Manual,
         SnapMeta { note: Some(format!("restored to {short}")), ..Default::default() },
         true,
-    )?;
+    )
+    .err()
+    .map(|e| format!("{e:#}"));
 
-    Ok(Restored { plan, commit, checkpoint })
+    Ok(Restored { plan, commit, checkpoint, bookkeeping_error })
 }
 
 pub fn short(oid: &str) -> &str {
