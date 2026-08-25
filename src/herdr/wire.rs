@@ -187,10 +187,13 @@ impl Subscription {
     /// for the per-pane topic only when you want one specific pane and nothing
     /// else.
     pub fn open(topics: &[Value]) -> Result<Self> {
+        // The read timeout `connect` set stays on for the handshake. Clearing
+        // it up front — which is what this used to do — meant a server that
+        // accepted the connection and then said nothing left the read below
+        // blocked with no deadline, for ever. That is upstream of every
+        // supervisor, backoff and give-up policy a caller might have, so the
+        // watcher wedged silently rather than reconnecting.
         let stream = connect()?;
-        // A subscription is long-lived and mostly silent; a read timeout here
-        // would fire on every idle stretch.
-        stream.set_read_timeout(None)?;
 
         let mut writer = stream.try_clone().context("cannot duplicate the herdr socket")?;
         let body = json!({
@@ -211,6 +214,10 @@ impl Subscription {
         if kind != "subscription_started" {
             bail!("herdr answered a subscription with `{kind}` instead of subscription_started");
         }
+
+        // Only now, for the streaming phase: a subscription is long-lived and
+        // mostly silent, so a deadline here would fire on every quiet stretch.
+        reader.get_ref().set_read_timeout(None)?;
         Ok(Self { reader })
     }
 

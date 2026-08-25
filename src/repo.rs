@@ -126,6 +126,10 @@ pub enum Warning {
     /// Ignored files are never captured, so they are never restored either.
     /// This is the property that keeps `node_modules` and `.env` safe.
     IgnoredFilesPresent,
+    /// A git repository inside the worktree that the user has not registered as
+    /// a submodule. Sheep records it as a pointer, so it can neither capture
+    /// nor restore anything inside it — and it will refuse to remove it.
+    NestedRepositories(Vec<String>),
 }
 
 impl std::fmt::Display for Warning {
@@ -138,6 +142,15 @@ impl std::fmt::Display for Warning {
             Warning::IgnoredFilesPresent => write!(
                 f,
                 "gitignored files present: Sheep never captures or overwrites them."
+            ),
+            Warning::NestedRepositories(paths) => write!(
+                f,
+                "{} nested git repositor{} ({}): recorded as a pointer only, so nothing inside {} captured or restored — and a restore that would remove {} will refuse instead.",
+                paths.len(),
+                if paths.len() == 1 { "y" } else { "ies" },
+                paths.join(", "),
+                if paths.len() == 1 { "it is" } else { "they are" },
+                if paths.len() == 1 { "it" } else { "them" },
             ),
         }
     }
@@ -213,6 +226,21 @@ pub fn inspect(wt: &Worktree, max_files: usize) -> Result<Health> {
 
     if !git.run_z(&["ls-files", "-o", "-i", "--exclude-standard", "-z"])?.is_empty() {
         health.warnings.push(Warning::IgnoredFilesPresent);
+    }
+
+    // An untracked directory that is itself a repository is the case `ls-files
+    // --stage` cannot see: it has no index entry until something commits it,
+    // yet `git add -A` will record it as a gitlink the moment Sheep snapshots.
+    // `--directory` stops git from listing its contents, so this stays cheap.
+    let nested: Vec<String> = git
+        .run_z(&["ls-files", "-o", "--directory", "--exclude-standard", "-z"])?
+        .into_iter()
+        .filter(|entry| entry.ends_with('/'))
+        .filter(|entry| wt.root.join(entry.trim_end_matches('/')).join(".git").exists())
+        .map(|entry| entry.trim_end_matches('/').to_string())
+        .collect();
+    if !nested.is_empty() {
+        health.warnings.push(Warning::NestedRepositories(nested));
     }
 
     Ok(health)

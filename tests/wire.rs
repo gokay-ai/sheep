@@ -167,3 +167,36 @@ fn live_session_answers_ping() {
     assert_eq!(pong["type"], "pong");
     assert!(pong["protocol"].is_number(), "the handshake should report a protocol version");
 }
+
+#[test]
+fn a_subscription_to_a_server_that_never_answers_times_out() {
+    // A server that accepts the connection and then says nothing used to leave
+    // `open` blocked with no deadline, because the read timeout was cleared
+    // before the acknowledgement rather than after it. That is upstream of
+    // every reconnect and give-up policy a caller might have, so the watcher
+    // wedged permanently and silently instead of backing off.
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("herdr.sock");
+    let listener = UnixListener::bind(&path).unwrap();
+    let (accepted_tx, accepted_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        if let Ok((stream, _)) = listener.accept() {
+            let _ = accepted_tx.send(());
+            // Hold the connection open and answer nothing at all.
+            std::thread::sleep(std::time::Duration::from_secs(30));
+            drop(stream);
+        }
+    });
+
+    let started = std::time::Instant::now();
+    let err = with_socket(&path, || Subscription::open(&[wire::topic("pane.created")]))
+        .expect_err("a silent server must not block for ever");
+    let waited = started.elapsed();
+
+    assert!(accepted_rx.recv_timeout(std::time::Duration::from_secs(5)).is_ok());
+    assert!(
+        waited < std::time::Duration::from_secs(25),
+        "gave up only after {waited:?}, which is no deadline at all"
+    );
+    let _ = err;
+}

@@ -190,24 +190,81 @@ impl Shadow {
     pub fn commit(&self, line: &str, tree: &str, message: &str) -> Result<Snapshot> {
         let at = now();
         let parent = self.head(line)?;
+        let commit = self.commit_tree(tree, parent.as_deref(), message, at)?;
+        self.git().run(&["update-ref", &Self::ref_name(line), &commit])?;
+        Ok(Snapshot { commit, tree: tree.to_string(), parent, at })
+    }
+
+    /// Write a commit object. Author and committer are pinned so Sheep works on
+    /// a machine with no `user.email`, and the date is passed in so a rewritten
+    /// history keeps the times the turns actually happened.
+    fn commit_tree(&self, tree: &str, parent: Option<&str>, message: &str, at: u64) -> Result<String> {
         let mut args: Vec<String> = vec!["commit-tree".into(), tree.into()];
-        if let Some(p) = &parent {
+        if let Some(p) = parent {
             args.push("-p".into());
-            args.push(p.clone());
+            args.push(p.to_string());
         }
         args.push("-m".into());
         args.push(message.into());
         let argv: Vec<&str> = args.iter().map(String::as_str).collect();
 
         let date = format!("{at} +0000");
-        let commit = self
-            .git()
+        self.git()
             .with_env("GIT_AUTHOR_DATE", &date)
             .with_env("GIT_COMMITTER_DATE", &date)
-            .run(&argv)?;
+            .run(&argv)
+    }
 
-        self.git().run(&["update-ref", &Self::ref_name(line), &commit])?;
-        Ok(Snapshot { commit, tree: tree.to_string(), parent, at })
+    /// Rebuild a timeline from `turns` as a fresh parent chain and point the ref
+    /// at it, returning the new commit id for each turn in order.
+    ///
+    /// This is how history is actually shortened. Dropping entries from the turn
+    /// log alone frees nothing, because every old commit stays reachable through
+    /// the chain; the oldest kept turn has to become a root before anything
+    /// earlier can be collected. The trees are reused untouched, so every kept
+    /// turn restores to exactly the same bytes as before — only the commit ids
+    /// change, which is why the caller has to rewrite the log with them.
+    pub fn rechain(&self, line: &str, turns: &[(String, String, u64)]) -> Result<Vec<String>> {
+        let mut parent: Option<String> = None;
+        let mut written = Vec::with_capacity(turns.len());
+        for (tree, message, at) in turns {
+            let commit = self.commit_tree(tree, parent.as_deref(), message, *at)?;
+            parent = Some(commit.clone());
+            written.push(commit);
+        }
+        match parent {
+            Some(head) => self.git().run(&["update-ref", &Self::ref_name(line), &head])?,
+            None => self.git().run(&["update-ref", "-d", &Self::ref_name(line)])?,
+        };
+        Ok(written)
+    }
+
+    /// Drop everything no ref reaches any more.
+    ///
+    /// Only ever run against Sheep's own shadow repository — the git dir here is
+    /// never the user's. Borrowed objects live in the user's store and are not
+    /// touched by this.
+    pub fn collect(&self) -> Result<()> {
+        let git = Git::bare(&self.git_dir);
+        git.run(&["reflog", "expire", "--expire=now", "--all"])?;
+        git.run(&["gc", "--prune=now", "--quiet"])?;
+        Ok(())
+    }
+
+    /// Bytes the shadow repository occupies.
+    pub fn size_bytes(&self) -> u64 {
+        fn walk(dir: &Path) -> u64 {
+            let Ok(entries) = std::fs::read_dir(dir) else { return 0 };
+            entries
+                .flatten()
+                .map(|e| match e.metadata() {
+                    Ok(m) if m.is_dir() => walk(&e.path()),
+                    Ok(m) => m.len(),
+                    Err(_) => 0,
+                })
+                .sum()
+        }
+        walk(&self.git_dir)
     }
 
     /// The ref a timeline records onto.
@@ -343,13 +400,46 @@ impl Shadow {
         }
 
         let root = &self.worktree.root;
+
+        // A removal is always a single file: `diff-tree -r` reports leaves, and
+        // an emptied directory is pruned afterwards. A removal that is a
+        // directory on disk therefore means one of two things, and neither may
+        // be deleted.
+        //
+        // The dangerous one is a nested git repository. `git add -A` records
+        // any repository inside the worktree as one gitlink entry — a commit
+        // pointer, nothing else — so restoring past the point it appeared
+        // produces a one-line plan whose contents no snapshot holds. Deleting
+        // it would take that repository's own history, its uncommitted work and
+        // its ignored files with it, and the checkpoint taken beforehand could
+        // not bring any of it back. That is invariants 4, 5 and 8 at once.
+        //
+        // The other is a path that turned into a directory between the plan and
+        // the write, which is the stale-tree case wearing a different hat.
+        let directories: Vec<&String> = plan
+            .remove
+            .iter()
+            .filter(|rel| std::fs::symlink_metadata(root.join(rel)).is_ok_and(|m| m.is_dir()))
+            .collect();
+        if let Some(first) = directories.first() {
+            bail!(
+                "refusing to restore: `{first}` is a directory whose contents Sheep never captured{}.\nA git repository inside your worktree is recorded only as a pointer, so removing it here would delete files no snapshot holds — including anything ignored inside it. Move or delete it yourself if that is what you want.",
+                if directories.len() > 1 {
+                    format!(" (and {} more)", directories.len() - 1)
+                } else {
+                    String::new()
+                }
+            );
+        }
+
         for rel in &plan.remove {
             let path = root.join(rel);
-            match std::fs::symlink_metadata(&path) {
-                Ok(meta) if meta.is_dir() => std::fs::remove_dir_all(&path)?,
-                Ok(_) => std::fs::remove_file(&path)
-                    .with_context(|| format!("cannot remove {}", path.display()))?,
-                Err(_) => {}
+            // A path already gone is not a problem: the goal is that it is not
+            // there afterwards, not that we were the one to remove it.
+            if let Err(e) = std::fs::remove_file(&path) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    return Err(e).with_context(|| format!("cannot remove {}", path.display()));
+                }
             }
         }
         prune_empty_dirs(root, &plan.remove)?;
@@ -398,6 +488,18 @@ impl Shadow {
                     parts.next().unwrap_or_default().to_string(),
                 ))
             })
+            .collect())
+    }
+
+    /// Paths a tree records as gitlinks — repositories nested inside the
+    /// worktree, stored as a commit pointer and nothing more.
+    pub fn gitlinks(&self, tree: &str) -> Result<Vec<String>> {
+        Ok(self
+            .git()
+            .run_z(&["ls-tree", "-r", "-z", "-t", tree])?
+            .into_iter()
+            .filter(|entry| entry.starts_with("160000"))
+            .filter_map(|entry| entry.split_once('\t').map(|(_, path)| path.to_string()))
             .collect())
     }
 
