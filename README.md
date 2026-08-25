@@ -9,7 +9,22 @@
 </p>
 
 ```text
-@@HERO@@
+ sheep  sheep                                                                          ready
+timeline claude · 5 turns · newest 12s ago · notify on
+╭ timeline ────────────────────────────────────────────────────────────────────────────────╮
+│▌#5   manual     claude                                                 637b1b65 · 12s ago│
+│▌  10 files   +18 −87   ████████████                                                      │
+│▌  extract the retry helper and use it everywhere                                         │
+│▌  637b1b6519de · 2026-08-25 19:13 UTC                                                    │
+│ #4   manual     claude                                                  75896f9e · 1m ago│
+│   1 file   +3 −0   █                                                                     │
+│   add a theme helper                                                                     │
+│ #3   manual     claude                                                  2d7c34cb · 4m ago│
+│   2 files   +5 −0   █                                                                    │
+│   cap the note length                                                                    │
+│                                                                                          │
+╰───────────────────────────────────────────────────────────────────────────────────── 1/5 ╯
+j/k move · enter rewind · ? keys · q quit · n notify · r refresh
 ```
 
 Sheep is a plugin for [herdr](https://herdr.dev), the terminal workspace manager that runs your coding agents in panes and hands each one its own git worktree. It watches herdr's per-pane agent status, snapshots the worktree the moment an agent finishes a turn, and keeps every snapshot in a git object store beside your repository rather than inside it.
@@ -18,7 +33,7 @@ Sheep is a plugin for [herdr](https://herdr.dev), the terminal workspace manager
 herdr plugin install gokay-ai/sheep/herdr-plugin
 ```
 
-No Rust needed: the install step downloads a checksum-verified binary for your platform, registers the timeline dock, the rewind overlay and the recorder, and starts recording. Herdr 0.8 reads keybindings from your own config, so paste [`herdr-plugin/keybindings.toml`](herdr-plugin/keybindings.toml) into `~/.config/herdr/config.toml` to get `prefix+Z` for the dock and `prefix+z` for the rewind overlay; until then both are in herdr's plugin-action menu.
+No Rust needed: the install step downloads a checksum-verified binary for your platform, registers the timeline dock, the rewind overlay and the recorder, and starts recording. Herdr 0.8 reads keybindings from your own config, so paste [`herdr-plugin/keybindings.toml`](herdr-plugin/keybindings.toml) into `~/.config/herdr/config.toml` to get `prefix+Z` for the dock and `prefix+z` for the rewind overlay; until then, `herdr plugin action invoke dock --plugin sheep` and `… invoke rewind --plugin sheep` do the same thing.
 
 ## "Claude Code already has `/rewind`"
 
@@ -37,43 +52,84 @@ Sheep does not restore a conversation. It restores files, and then tells the con
 
 `sheep watch` holds one subscription to herdr and follows every agent pane in the session. When a pane leaves `working` for `idle`/`done` it opens a *candidate* boundary — and then refuses to believe it for ten seconds, because herdr infers status from what a pane paints and calls agents `done` mid-turn. The default settle window is measured rather than guessed: a live herdr 0.8.0 session was watched flipping a pane to `done` and back to `working` **9.2 seconds later**, with the agent still working.
 
-The recorder says what it did, in a log file rather than in the pane you are using:
+It says what it did in a log file rather than in the pane you are using. From a real run against
+a session with eight agent panes (home paths shortened):
 
 ```text
-w3K:p1: baseline #1 on claude — 57 file(s) in /…/sheep
-w3K:p1: still spawning processes; waiting
-w3K:p1: recorded #12 on claude — 9 file(s) +214 -186 in /…/sheep
-w3K:p1: nothing changed on claude; not recorded
-w3K:p1: withdrawn — the pane went back to working — false done
-w3K:p1: the pane is now in /…/other but the turn happened in /…/sheep; skipped
+$ tail -f ~/.local/state/herdr/plugins/sheep/logs/watch.log
+2026-08-25 18:54:43Z info w3K:p1: baseline #1 on w3K:p1 — 57 file(s) in ~/…/herdr-max
+2026-08-25 18:56:45Z info w3S:p1: herdr no longer lists an agent here; forgetting it
+2026-08-25 18:59:26Z info w3N:p1: still spawning processes; waiting
+2026-08-25 18:59:36Z info w3N:p1: nothing changed on w3N:p1; not recorded
+2026-08-25 19:02:58Z info w31:pW: recorded #2 on w31:pW — 5 file(s) +290 -162 in ~/…
 ```
 
-An agent that answered a question without editing anything does not get a row.
+An agent that answered a question without editing anything does not get a row. Neither does a
+candidate that goes back to `working`, or to `blocked`, or whose pane changes directory while the
+turn is in flight, or whose foreground process group is still starting things — each of those
+withdraws the boundary and says which one it was.
 
 ### Shows you the plan before it writes anything
 
 `sheep ui --rewind`, or `prefix+z`. Pick a turn; every path it would touch is split into what gets written and what gets removed, the diff for the selected file is read out of the snapshot, and the footer says the consequence in words. Restore is `shift+R` and nothing else — `enter` opens a diff, lower-case `r` is refresh, and a plan nobody has looked at cannot be applied.
 
 ```text
-@@REWIND@@
+ sheep  sheep                                                                          ready
+timeline claude · 5 turns · newest 12s ago · notify on
+╭ rewind to #4 ────────────────────────────────────────────────────────────────────────────╮
+│back to #4  1m ago · claude · manual                                          75896f9e7a2f│
+│add a theme helper                                                                        │
+│10 paths change  —  10 written · 0 removed                                                │
+│──────────────────────────────────────────────────────────────────────────────────────────│
+│ will be written (10)                 ╭ src/git.rs ──────────────────────────────────────╮│
+│▌+ src/git.rs                         │@@ -192,5 +192,3 @@ impl Git {                    ││
+│ + src/herdr/detect.rs                │ pub fn canonical(path: &Path) -> Result<PathBuf> ││
+│ + src/ops.rs                         │     std::fs::canonicalize(path).with_context(|| f││
+│ + src/repo.rs                        │ }                                                ││
+│ + src/shadow.rs                      │-                                                 ││
+│ + src/store.rs                       │-// refactor: routed through the new abstraction  ││
+│ + src/tui/app.rs                     │                                                  ││
+│ + src/tui/engine.rs                  │                                                  ││
+│ + src/tui/render.rs                  │                                                  ││
+│ + src/tui/theme.rs                   │                                                  ││
+│                                      │                                                  ││
+│                                      │                                                  ││
+│                                      │                                                  ││
+│                                      │                                                  ││
+│                                      │                                                  ││
+│                                      ╰──────────────────────────────────────────────────╯│
+│──────────────────────────────────────────────────────────────────────────────────────────│
+│ restoring rewrites 10 files and deletes 0 files under sheep/.                            │
+│ the tree you have now is snapshotted first as a new turn, so this is undoable.           │
+│ the agent in pane w3K:p1 will be told what was taken back.                               │
+│ shift+R  restore   esc back · d diff · J/K scroll · n notify · q quit                    │
+╰──────────────────────────────────────────────────────── dry run — nothing is written yet ╯
 ```
 
-The same thing on the command line, which touches nothing:
+Both frames above are real output: `sheep ui --snapshot 92x16` and `sheep ui --rewind --select 4 --keys d --snapshot 92x30`, run against a five-turn timeline. `--snapshot` draws one frame of the interface into an off-screen buffer and writes it to stdout as text, so what you are looking at can be reviewed in a pull request and asserted in CI with no pseudo-terminal involved. Those five turns were recorded by hand with `sheep snap`, which is why they are labelled `manual` — the recorder labels its own `turn`.
+
+The same plan on the command line, which touches nothing either:
 
 ```console
-$ sheep diff '#3'
-restore to 402a363e2183  ·  10 file(s) written, 0 removed
+$ sheep diff '#4'
+restore to 75896f9e7a2f  ·  10 file(s) written, 0 removed
   write   src/git.rs
   write   src/herdr/detect.rs
   write   src/ops.rs
-  …
+  write   src/repo.rs
+  write   src/shadow.rs
+  write   src/store.rs
+  write   src/tui/app.rs
+  write   src/tui/engine.rs
+  write   src/tui/render.rs
+  write   src/tui/theme.rs
 ```
 
 ### Tells the agent what you took back
 
 The message that lands in the agent's pane after a restore:
 
-> `[sheep]` Your working tree was rewound to turn #9 (a2833b233722). 10 path(s) changed on disk: 9 rewritten, 1 deleted. Anything you wrote after turn #9 is no longer on disk — re-read any file before you edit it, and do not re-apply the reverted changes unless you are asked to. The state from just before the rewind was kept as turn #13; `sheep restore #13 --yes` puts it back.
+> `[sheep]` Your working tree was rewound to turn #4 (75896f9e7a2f). 10 path(s) changed on disk: 10 rewritten, 0 deleted. Anything you wrote after turn #4 is no longer on disk — re-read any file before you edit it, and do not re-apply the reverted changes unless you are asked to. The state from just before the rewind was kept as turn #6; `sheep restore #6 --yes` puts it back.
 
 Outside herdr this is a no-op by construction rather than by a branch, so the interface behaves identically in a plain terminal.
 
@@ -111,17 +167,17 @@ Move or delete it yourself if that is what you want.. Your files were put back a
 
 **The plan you read.** An agent keeps working while you are reading a plan. Sheep carries the tree the plan was computed against into the write and refuses if it moved, handing back the plan as it stands now instead of applying one nobody looked at. → `a_restore_refuses_a_plan_the_tree_has_moved_out_from_under`
 
-And `--yes` is required for anything to be written, from the CLI and from the overlay alike.
+And nothing is written without an explicit confirmation: `--yes` on the command line, `shift+R` on a plan that is on the screen in front of you.
 
 ## How it works
 
-**The shadow repository.** One bare git repository per worktree, under Sheep's state directory, with `objects/info/alternates` pointing at your object database (and at anything your repository itself borrows from, so a `--reference` clone resolves too). A snapshot is `git add -A` into a throwaway index, `write-tree`, `commit-tree`, `update-ref refs/sheep/<timeline>` — your index is never involved. Unchanged content costs nothing, because it is already an object in your store.
+**The shadow repository.** One bare git repository per worktree, under Sheep's state directory, with `objects/info/alternates` pointing at your object database (and at anything your repository itself borrows from, so a `--reference` clone resolves too). A snapshot is `git add -A` into a throwaway index, `write-tree`, `commit-tree`, `update-ref refs/sheep/<timeline>` — your index is never involved. Anything your repository already holds as an object costs nothing to snapshot; only what has changed since your last commit is written, and only once.
 
 **Turn detection at corroborated status edges.** A candidate opens only on `working` → at-rest, and only for a pane that has actually been seen working since its last recorded turn. It has to survive a quiet window with no status change and no new output — herdr's per-pane revision counter is what "no new output" means, and a still-working agent paints. Going back to `working`, `blocked` or `unknown` withdraws it. So does moving directory: a turn is bound to the directory it *started* in, fixed on the edge into `working`, because a `cd` that arrives mid-turn is otherwise absorbed by every later check. When the window elapses, the recorder corroborates before writing: it re-asks herdr for the pane, and it asks the kernel — if the pids in the pane's foreground process group changed, that is an agent running tools, not an agent that has stopped, and the window is extended.
 
 **The write-back.** A restore driven from the overlay finishes by sending the agent in that pane a message over herdr's `agent.prompt`. The turn number, the file counts, the instruction to re-read, and the checkpoint that reverses it.
 
-**Costs, measured.** On a 12,000-file / 95 MB checkout: first snapshot 1.17 s, subsequent snapshots 0.35 s, `sheep diff` 0.32 s, a restore 1.43 s. Recording a live herdr session with eight agent panes — two of the repositories 1.05 GB of checkout between them — cost 412 KB of state, because the content is borrowed. `sheep gc --keep 10` took a 32-turn timeline's shadow repository from 315 KB to 131 KB, and turn #28 restored to a byte-identical tree before and after — which is also `a_kept_turn_still_restores_to_the_same_files_after_collection`.
+**Costs, measured.** On a 12,000-file, 95 MB checkout: first snapshot 1.17 s, subsequent snapshots 0.35 s, `sheep diff` 0.32 s, a restore 1.43 s. Recording a whole live herdr session — eight agent panes across six checkouts — cost 1.5 MB of state; the two largest of those checkouts are 1.05 GB between them and account for 440 KB of it, because unchanged content is borrowed rather than copied. `sheep gc --keep 10` took a 32-turn timeline's shadow repository from 315 KB to 131 KB, and turn #28 restored to a byte-identical tree before and after — which is what `a_kept_turn_still_restores_to_the_same_files_after_collection` asserts in general.
 
 ## Commands and configuration
 
@@ -148,6 +204,15 @@ Options:
       --max-files <MAX_FILES>  Refuse to touch a worktree with more tracked files than this [default: 60000]
   -h, --help                   Print help (see more with '--help')
   -V, --version                Print version
+```
+
+```console
+$ sheep log
+#5    637b1b6519de  manual       10 files  +18     -87     extract the retry helper and use it everywhere
+#4    75896f9e7a2f  manual        1 files  +3      -0      add a theme helper
+#3    2d7c34cb256c  manual        2 files  +5      -0      cap the note length
+#2    a2e6dd9adcc3  manual        1 files  +2      -0      raise the settle window to 12s
+#1    a2833b233722  manual       58 files  +0      -0      start of session
 ```
 
 `sheep gc` is the one worth knowing: trimming the turn log alone frees nothing, because every old commit stays reachable through the parent chain, so `gc` rebuilds the kept turns as a fresh chain against the same trees — every one of them still restores to exactly the same bytes — and only then collects. `--keep 500` and `--max-age-days 30` by default, dry run unless `--yes`.
