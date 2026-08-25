@@ -63,6 +63,14 @@ jobs:
       - name: installer platform detection
         run: bash herdr-plugin/scripts/test-install.sh
 
+      # herdr dispatches hooks concurrently and both of Sheep's event hooks
+      # call `watchd.sh start`, so "exactly one recorder" is a race, and a race
+      # is not something a reviewer sees in a diff. Eight starts at once, then a
+      # count. It also asserts `stop` sweeps orphans and that `status` names the
+      # log the recorder actually writes turns to.
+      - name: the recorder daemon keeps exactly one recorder
+        run: bash herdr-plugin/scripts/test-watchd.sh
+
       - name: manifest and crate versions agree
         run: |
           set -eu
