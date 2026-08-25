@@ -36,7 +36,7 @@ fn app_with(turns: Vec<Turn>) -> App {
     let mut app = App::new("checkout-service", "/tmp/checkout-service", "default");
     app.inside_herdr = true;
     app.now = NOW;
-    app.apply(Reply::Loaded { turns, blockers: vec![], warnings: vec![] });
+    app.apply(Reply::Loaded { turns, blockers: vec![], warnings: vec![], others: vec![] });
     app
 }
 
@@ -178,6 +178,34 @@ fn the_empty_state_says_what_to_run() {
     hides(&screen, "1/0");
 }
 
+/// The empty state that matters: this worktree HAS turns, just not on the
+/// timeline this pane was pointed at. Saying only "nothing recorded yet" is
+/// how a dock reading the wrong name went unnoticed for a whole release, so an
+/// empty timeline beside a non-empty one has to name the other one.
+#[test]
+fn an_empty_timeline_names_the_ones_that_are_not() {
+    let mut app = App::new("checkout-service", "/tmp/checkout-service", "default");
+    app.now = NOW;
+    app.apply(Reply::Loaded {
+        turns: vec![],
+        blockers: vec![],
+        warnings: vec![],
+        others: vec!["claude".into(), "codex".into()],
+    });
+    let screen = frame(&app, 64, 20);
+    shows(&screen, "nothing recorded on `default` yet");
+    shows(&screen, "but this worktree has: claude, codex");
+    shows(&screen, "sheep ui --line claude");
+}
+
+/// And it must not invent one when there is genuinely nothing else here.
+#[test]
+fn an_empty_worktree_claims_no_other_timelines() {
+    let screen = frame(&app_with(vec![]), 64, 16);
+    hides(&screen, "but this worktree has");
+    hides(&screen, "--line");
+}
+
 #[test]
 fn a_blocked_worktree_is_named_above_the_timeline() {
     let mut app = demo();
@@ -185,6 +213,7 @@ fn a_blocked_worktree_is_named_above_the_timeline() {
         turns: app.turns.clone(),
         blockers: vec!["a rebase is in progress. Sheep will not touch a tree mid-operation.".into()],
         warnings: vec![],
+        others: vec![],
     });
     let screen = frame(&app, 76, 18);
     shows(&screen, "blocked");

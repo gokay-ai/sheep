@@ -134,6 +134,16 @@ pub enum Reply {
         turns: Vec<Turn>,
         blockers: Vec<String>,
         warnings: Vec<String>,
+        /// Every *other* timeline recorded for this worktree.
+        ///
+        /// Carried whether or not `turns` is empty, because the case it exists
+        /// for is the one where it is: a dock reading a timeline nothing writes
+        /// looks exactly like a dock reading a timeline nothing has written
+        /// *yet*, and the difference is the difference between "wait" and "you
+        /// are in the wrong place". Slugs, not raw names — `Store::lines_for`
+        /// reads file stems, and the file stem is what [`crate::store::slug`]
+        /// made of the name.
+        others: Vec<String>,
     },
     Turns(Vec<Turn>),
     Broken(String),
@@ -243,7 +253,22 @@ fn load(ctx: &Ctx) -> anyhow::Result<Reply> {
         turns,
         blockers: health.blockers.iter().map(ToString::to_string).collect(),
         warnings: health.warnings.iter().map(ToString::to_string).collect(),
+        others: others(ctx),
     })
+}
+
+/// The timelines this worktree has that are not the one on screen.
+///
+/// A failure here is not a failure to load: the timeline the user asked for
+/// has already been read, and an unreadable state directory would have stopped
+/// that first. So this answers with what it can see and never with an error.
+fn others(ctx: &Ctx) -> Vec<String> {
+    let mine = crate::store::slug(&ctx.line);
+    Store::lines_for(&ctx.state, &ctx.wt.id)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|line| *line != mine)
+        .collect()
 }
 
 fn plan(ctx: &Ctx, seq: u64) -> anyhow::Result<PlanView> {

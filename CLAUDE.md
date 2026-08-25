@@ -52,6 +52,15 @@ holds by construction: `src/git.rs` is the only place that spawns git, and it sp
 A **timeline** (`--line`) is one recording stream. `sheep watch` names one per agent per worktree
 by default (`--line-by pane` for one per pane); a standalone `sheep snap` uses `default`.
 
+**The plugin has to name timelines the same way the recorder does.** `watchd.sh` starts
+`sheep watch` with no flags, so turns are filed under the agent — `claude`, `codex` — and
+`herdr-plugin/scripts/common.sh:sheep_target_line` reads `focused_pane_agent` out of herdr's
+invocation context to reach the same string, falling back to `default` (never to the pane id,
+which herdr reassigns on every restart). When the two disagree the dock reads a timeline nothing
+writes and says "nothing recorded yet", which is indistinguishable from the truth — so
+`tests/plugin_timeline.rs` runs both halves and compares them, and the dock's empty state names
+the other timelines `Store::lines_for` can see.
+
 ## Commands
 
 ```bash

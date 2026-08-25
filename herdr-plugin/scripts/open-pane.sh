@@ -7,7 +7,8 @@
 # The manifest cannot express "start in the focused agent's worktree" — a pane
 # command is a fixed argv and herdr defaults the pane's cwd to the plugin root —
 # so the action goes through `herdr plugin pane open`, which takes --cwd. That is
-# also where the timeline name is threaded through: one timeline per agent pane.
+# also where the timeline name is threaded through: one timeline per agent per
+# checkout, the same name `sheep watch` files its turns under.
 
 set -eu
 
@@ -40,6 +41,9 @@ fi
 # SHEEP_LINE is the seam the TUI reads to know which timeline the pane belongs
 # to: `sheep ui` resolves its own repository and would otherwise fall back to
 # the `default` line, which is the wrong timeline in a multi-agent workspace.
+# `sheep_target_line` is what keeps this string equal to the one the recorder
+# writes under; when they disagree the dock shows an empty timeline and says
+# nothing has been recorded, which is the worst thing this plugin can do.
 exec "$herdr_bin" plugin pane open \
   --plugin "$plugin_id" \
   --entrypoint "$entrypoint" \

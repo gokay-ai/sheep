@@ -108,6 +108,10 @@ pub struct App {
     patch_cache: HashMap<String, String>,
     pub blockers: Vec<String>,
     pub warnings: Vec<String>,
+    /// The other timelines recorded for this worktree, as the empty state names
+    /// them. Set on every load, not only when the timeline is empty, so a dock
+    /// that goes empty after a `gc` still knows what else is there.
+    pub others: Vec<String>,
     /// Set when the working tree may not be in any state Sheep recorded: a
     /// restore that stopped between its deletions and its writes, or a worker
     /// that vanished while one was running. It outlives the status line
@@ -151,6 +155,7 @@ impl App {
             patch_cache: HashMap::new(),
             blockers: Vec::new(),
             warnings: Vec::new(),
+            others: Vec::new(),
             uncertain: None,
             fatal: None,
             status: None,
@@ -479,10 +484,11 @@ impl App {
 
     pub fn apply(&mut self, reply: Reply) {
         match reply {
-            Reply::Loaded { turns, blockers, warnings } => {
+            Reply::Loaded { turns, blockers, warnings, others } => {
                 self.loading = false;
                 self.blockers = blockers;
                 self.warnings = warnings;
+                self.others = others;
                 self.set_turns(turns);
             }
             Reply::Turns(turns) => {

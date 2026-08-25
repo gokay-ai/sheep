@@ -141,6 +141,7 @@ fn app_with_plan() -> App {
         }],
         blockers: vec![],
         warnings: vec![],
+        others: vec![],
     });
     app.on_key(Key::Enter);
     let jobs = app.take_jobs();
@@ -149,12 +150,55 @@ fn app_with_plan() -> App {
     app
 }
 
+/// The dock has to be able to tell "nothing has happened yet" from "you are
+/// reading a timeline nothing writes". That is not a rendering nicety: the two
+/// were indistinguishable while the recorder filed turns under `claude` and the
+/// plugin's panes opened `w31:pW`, and the second one is a lie.
+#[test]
+fn a_load_reports_the_other_timelines_recorded_for_this_worktree() {
+    let fixture = Fixture::new();
+    fixture.write("a.txt", "one\n");
+    git(&fixture.repo, &["add", "-A"]);
+    git(&fixture.repo, &["commit", "--quiet", "-m", "init"]);
+
+    // Two agents recorded here; the pane about to open is pointed elsewhere.
+    for line in ["claude", "codex"] {
+        ops::snap(
+            &fixture.wt(),
+            &fixture.state,
+            line,
+            DEFAULT_MAX_FILES,
+            TurnKind::Turn,
+            SnapMeta { agent: Some(line.into()), ..Default::default() },
+            true,
+        )
+        .unwrap()
+        .unwrap();
+    }
+
+    let mut ctx = fixture.ctx();
+    ctx.line = "w31:pW".into();
+    let Reply::Loaded { turns, others, .. } = engine::execute(&ctx, Job::Reload) else {
+        panic!("a reload should load")
+    };
+    assert!(turns.is_empty(), "nothing was ever recorded under a pane id");
+    assert_eq!(others, vec!["claude".to_string(), "codex".to_string()]);
+
+    // And the timeline you are actually on is not offered as somewhere else to
+    // look — `Store::lines_for` answers in slugs, so the comparison has to.
+    ctx.line = "claude".into();
+    let Reply::Loaded { others, .. } = engine::execute(&ctx, Job::Reload) else {
+        panic!("a reload should load")
+    };
+    assert_eq!(others, vec!["codex".to_string()]);
+}
+
 // ------------------------------------------------------- the road to a write
 
 #[test]
 fn no_plan_on_screen_means_no_restore() {
     let mut app = App::new("demo", "/tmp/demo", "default");
-    app.apply(Reply::Loaded { turns: vec![], blockers: vec![], warnings: vec![] });
+    app.apply(Reply::Loaded { turns: vec![], blockers: vec![], warnings: vec![], others: vec![] });
     // Nothing recorded: enter must not even open the picker, and must say why
     // rather than leaving the user on an empty overlay.
     app.on_key(Key::Enter);
@@ -170,6 +214,7 @@ fn no_plan_on_screen_means_no_restore() {
         turns: app.turns.clone(),
         blockers: vec!["a rebase is in progress.".into()],
         warnings: vec![],
+        others: vec![],
     });
     app.on_key(Key::Enter);
     assert!(app.take_jobs().is_empty(), "a blocked worktree must not even be planned against");
