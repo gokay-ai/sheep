@@ -263,8 +263,35 @@ impl Shadow {
         let at = now();
         let parent = self.head(line)?;
         let commit = self.commit_tree(tree, parent.as_deref(), message, at)?;
-        self.git().run(&["update-ref", &Self::ref_name(line), &commit])?;
+        self.set_ref(line, &commit, parent.as_deref())?;
         Ok(Snapshot { commit, tree: tree.to_string(), parent, at })
+    }
+
+    /// Move a timeline's ref, and only from where we last saw it.
+    ///
+    /// `update-ref <ref> <new> <old>` is git's compare-and-swap, and the old
+    /// value costs nothing to pass. `crate::lock` is what actually keeps two
+    /// writers apart; this is the second answer to the same question, for the
+    /// case the first one is not there — an older Sheep running beside this
+    /// one, or a lock broken as stale while this process was frozen. Read the
+    /// head, commit onto it, and swap: if anything moved the ref in between,
+    /// the swap fails and the caller reports a turn that was not recorded,
+    /// rather than the ref quietly forgetting whatever the other writer put
+    /// there.
+    ///
+    /// An empty `<old>` is how git spells "this ref must not exist yet", which
+    /// is exactly the first turn on a timeline.
+    fn set_ref(&self, line: &str, new: &str, expect: Option<&str>) -> Result<()> {
+        let name = Self::ref_name(line);
+        let out = self.git().output(&["update-ref", &name, new, expect.unwrap_or("")])?;
+        if !out.status.success() {
+            bail!(
+                "the timeline `{line}` moved while Sheep was writing to it (expected {}): {}\nAnother Sheep process is recording into this worktree. Nothing was recorded here.",
+                expect.map(crate::ops::short).unwrap_or("nothing"),
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        Ok(())
     }
 
     /// Write a commit object. Author and committer are pinned so Sheep works on
@@ -302,7 +329,18 @@ impl Shadow {
     /// earlier can be collected. The trees are reused untouched, so every kept
     /// turn restores to exactly the same bytes as before — only the commit ids
     /// change, which is why the caller has to rewrite the log with them.
-    pub fn rechain(&self, line: &str, turns: &[(String, String, u64)]) -> Result<Vec<String>> {
+    ///
+    /// `expect` is where the ref stood when the caller read the turns it is
+    /// rebuilding. The swap is refused if it has moved since, because a ref
+    /// that moved means a turn was recorded that is not in `turns` — and
+    /// pointing the ref at this chain regardless is how that turn's objects
+    /// stop being reachable a moment before the prune deletes them.
+    pub fn rechain(
+        &self,
+        line: &str,
+        turns: &[(String, String, u64)],
+        expect: Option<&str>,
+    ) -> Result<Vec<String>> {
         let mut parent: Option<String> = None;
         let mut written = Vec::with_capacity(turns.len());
         for (tree, message, at) in turns {
@@ -311,8 +349,15 @@ impl Shadow {
             written.push(commit);
         }
         match parent {
-            Some(head) => self.git().run(&["update-ref", &Self::ref_name(line), &head])?,
-            None => self.git().run(&["update-ref", "-d", &Self::ref_name(line)])?,
+            Some(head) => self.set_ref(line, &head, expect)?,
+            None => {
+                let name = Self::ref_name(line);
+                let mut args = vec!["update-ref", "-d", &name];
+                if let Some(old) = expect {
+                    args.push(old);
+                }
+                self.git().run(&args)?;
+            }
         };
         Ok(written)
     }

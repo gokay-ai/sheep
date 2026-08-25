@@ -4,11 +4,31 @@
 //! spawning a process, and so the daemon and the TUI can call exactly what the
 //! CLI calls rather than a parallel implementation.
 
+use crate::lock;
 use crate::repo::{self, Worktree};
 use crate::shadow::{self, RestorePlan, Shadow};
 use crate::store::{Store, Turn, TurnKind};
 use anyhow::{bail, Result};
 use std::path::Path;
+use std::time::Duration;
+
+/// How long a snapshot waits for the worktree lock before giving up.
+///
+/// This is the recorder's number, and the recorder must never stall a session.
+/// It is long enough to sit out an ordinary `sheep gc` (2.5 s for `--keep 400`)
+/// and short enough that a pathological one costs a skipped turn rather than a
+/// hung `sheep watch`. Losing a turn is recoverable — the next one records the
+/// same tree — and [`lock::Busy`] says plainly what happened, so the recorder
+/// logs it and keeps watching the other panes.
+const SNAP_WAIT: Duration = Duration::from_secs(5);
+
+/// How long a restore or a collection waits.
+///
+/// Both are things a person asked for and is watching, and neither has anything
+/// useful to do without the lock, so they sit out even a long collection rather
+/// than refuse. Still bounded: a wedged state directory must surface as an
+/// error somebody can read, not as a command that never returns.
+const WRITE_WAIT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Default, Clone)]
 pub struct SnapMeta {
@@ -23,7 +43,27 @@ pub struct SnapMeta {
 /// Returns `None` when the tree is byte-identical to the previous turn and
 /// `allow_empty` is false — an agent that answered a question without editing
 /// anything should not litter the timeline.
+///
+/// Takes the worktree lock for the whole of it. Minting a sequence number and
+/// writing the turn that claims it has to be one step, and the objects this
+/// writes are reachable from nothing until the final `update-ref` — a
+/// concurrent [`collect`] would prune them out from under it. Fails with
+/// [`lock::Busy`] if the lock does not come free; see [`SNAP_WAIT`].
 pub fn snap(
+    wt: &Worktree,
+    state: &Path,
+    line: &str,
+    max_files: usize,
+    kind: TurnKind,
+    meta: SnapMeta,
+    allow_empty: bool,
+) -> Result<Option<Turn>> {
+    let _guard = lock::hold(state, &wt.id, SNAP_WAIT)?;
+    snap_locked(wt, state, line, max_files, kind, meta, allow_empty)
+}
+
+/// [`snap`] with the worktree lock already held by the caller.
+fn snap_locked(
     wt: &Worktree,
     state: &Path,
     line: &str,
@@ -75,6 +115,15 @@ pub fn snap(
     Ok(Some(turn))
 }
 
+/// True when `error` is the worktree lock being held by somebody else.
+///
+/// The recorder wants to say "skipped, a collection is running" rather than
+/// "cannot record"; a person at a terminal wants to be told to try again. Both
+/// need to tell contention apart from a repository that is genuinely unsafe.
+pub fn is_busy(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<lock::Busy>().is_some()
+}
+
 /// Resolve `#7`, `7`, or a snapshot commit id to a commit on `line`.
 pub fn resolve_target(shadow: &Shadow, store: &Store, line: &str, target: &str) -> Result<String> {
     let bare = target.trim_start_matches('#');
@@ -94,8 +143,26 @@ pub struct Planned {
     pub plan: RestorePlan,
 }
 
-/// Work out what a restore would do. Touches nothing.
+/// Work out what a restore would do. Touches nothing in the working tree.
+///
+/// It does write a tree object into the shadow, and it resolves a commit that a
+/// concurrent [`collect`] is in the middle of rewriting, so it takes the lock
+/// too — and releases it on the way out. The lock is never held across the time
+/// a human spends reading a plan; [`restore_expecting`] is what makes the plan
+/// they read the plan that runs.
 pub fn plan(
+    wt: &Worktree,
+    state: &Path,
+    line: &str,
+    target: &str,
+    max_files: usize,
+) -> Result<Planned> {
+    let _guard = lock::hold(state, &wt.id, SNAP_WAIT)?;
+    plan_locked(wt, state, line, target, max_files)
+}
+
+/// [`plan`] with the worktree lock already held by the caller.
+fn plan_locked(
     wt: &Worktree,
     state: &Path,
     line: &str,
@@ -211,6 +278,12 @@ pub fn restore(
 /// is abandoned with a [`StaleTree`] carrying the current plan. The check lives
 /// inside the operation rather than in the caller so that the verified plan and
 /// the applied plan are the same object, with no window between them.
+///
+/// The worktree lock is held from the recomputed plan through to the turn that
+/// records where we landed. That whole span has to be exclusive: a [`collect`]
+/// starting midway would drop the checkpoint this promises the user by number
+/// and prune the objects behind it — which is exactly how a "previous state
+/// kept as turn #501" turned out not to be there.
 pub fn restore_expecting(
     wt: &Worktree,
     state: &Path,
@@ -219,7 +292,8 @@ pub fn restore_expecting(
     max_files: usize,
     expect_tree: Option<&str>,
 ) -> Result<Restored> {
-    let Planned { shadow, commit, plan, .. } = plan(wt, state, line, target, max_files)?;
+    let _guard = lock::hold(state, &wt.id, WRITE_WAIT)?;
+    let Planned { shadow, commit, plan, .. } = plan_locked(wt, state, line, target, max_files)?;
 
     if let Some(expected) = expect_tree {
         if plan.current_tree != expected {
@@ -239,7 +313,7 @@ pub fn restore_expecting(
     let short = short(&commit);
     // Undo has to be undoable. This happens before a single byte of the working
     // tree changes.
-    let checkpoint = snap(
+    let checkpoint = snap_locked(
         wt,
         state,
         line,
@@ -275,7 +349,7 @@ pub fn restore_expecting(
     // bookkeeping and not the restore. Returning an error would tell someone
     // their files are as they were when they are not, and send them to undo
     // something that worked.
-    let bookkeeping_error = snap(
+    let bookkeeping_error = snap_locked(
         wt,
         state,
         line,
@@ -329,7 +403,27 @@ pub struct Collected {
 /// and only then can the rest be collected.
 ///
 /// `apply == false` reports what would happen and changes nothing.
+///
+/// Exclusive for the whole of it, and this is the operation the lock exists
+/// for. What happens here is a read-modify-write of an append-only log with
+/// seconds between the read and the write — `store.all()`, one `commit-tree`
+/// per kept turn, then a rebuilt file renamed over the live one — followed by
+/// `gc --prune=now`. A turn appended anywhere in that window is not in the
+/// snapshot being rebuilt, so the rename drops it and the prune takes its
+/// objects, however successfully it reported itself at the time.
 pub fn collect(
+    wt: &Worktree,
+    state: &Path,
+    line: &str,
+    policy: Retention,
+    apply: bool,
+) -> Result<Collected> {
+    let _guard = lock::hold(state, &wt.id, WRITE_WAIT)?;
+    collect_locked(wt, state, line, policy, apply)
+}
+
+/// [`collect`] with the worktree lock already held by the caller.
+fn collect_locked(
     wt: &Worktree,
     state: &Path,
     line: &str,
@@ -339,6 +433,12 @@ pub fn collect(
     let shadow = Shadow::ensure(wt.clone(), state)?;
     let store = Store::open(state, &wt.id, line)?;
     let turns = store.all()?;
+    // The ref as it stood when those turns were read. Under the lock it cannot
+    // move; passing it to `rechain` anyway means that if it ever does — an
+    // older Sheep beside this one, or a lock broken while this process was
+    // frozen — the rewrite is refused rather than silently dropping whatever
+    // was recorded in between.
+    let head_before = shadow.head(line)?;
 
     let mut report = Collected {
         line: line.to_string(),
@@ -373,7 +473,7 @@ pub fn collect(
 
     let chain: Vec<(String, String, u64)> =
         kept.iter().map(|t| (t.tree.clone(), t.subject(), t.at)).collect();
-    let rewritten = shadow.rechain(line, &chain)?;
+    let rewritten = shadow.rechain(line, &chain, head_before.as_deref())?;
 
     // The commit ids changed, so the log has to carry the new ones or a restore
     // would look up a commit that is no longer reachable.
@@ -392,14 +492,19 @@ pub fn collect(
 }
 
 /// Shorten every timeline recorded for `wt`.
+///
+/// One lock for the lot, not one per timeline: the final prune is on the shadow
+/// repository the timelines share, so releasing between them would open exactly
+/// the window [`collect`] closes.
 pub fn collect_all(
     wt: &Worktree,
     state: &Path,
     policy: Retention,
     apply: bool,
 ) -> Result<Vec<Collected>> {
+    let _guard = lock::hold(state, &wt.id, WRITE_WAIT)?;
     Store::lines_for(state, &wt.id)?
         .into_iter()
-        .map(|line| collect(wt, state, &line, policy, apply))
+        .map(|line| collect_locked(wt, state, &line, policy, apply))
         .collect()
 }
