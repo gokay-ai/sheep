@@ -231,7 +231,7 @@ rows = [["state_icon", "workspace", "tab"], ["agent", "$turn"]]
 
 Then `herdr server reload-config`. Without that row the metadata is reported and never displayed.
 
-**`SHEEP_LINE` picks the timeline a pane belongs to.** A pane's command line is fixed by the plugin manifest, so two docks launched from the same manifest entry are the same argv; the environment the pane is opened with is the only thing that can tell one from another. `SHEEP_LINE` is read as the default for `--line`, which is how a dock knows whose timeline it is showing.
+**`SHEEP_LINE` picks the timeline a pane belongs to.** A pane's command line is fixed by the plugin manifest, so two docks launched from the same manifest entry are the same argv; the environment the pane is opened with is the only thing that can tell one from another. `SHEEP_LINE` is read as the default for `--line`, which is how a dock knows whose timeline it is showing. The plugin sets it to the agent herdr attributes to the pane — the same name `sheep watch` files that pane's turns under, because that is `--line-by`'s default. If the two ever drift apart the dock reads a timeline nothing writes and reports an empty history, so a test runs both halves and compares them, and the dock's empty state names the other timelines it can see for the worktree.
 
 Other environment: `SHEEP_STATE_DIR` overrides where state lives, with precedence `HERDR_PLUGIN_STATE_DIR` > `SHEEP_STATE_DIR` > `XDG_STATE_HOME` > `~/.local/state/sheep`. Set it when you are experimenting so nothing lands in the real one.
 
