@@ -140,6 +140,45 @@ impl std::fmt::Display for StaleTree {
 
 impl std::error::Error for StaleTree {}
 
+/// A restore failed partway through.
+///
+/// [`Shadow::apply`] removes before it writes, and it has to: a path that
+/// changes between a file and a directory cannot be written while the old shape
+/// is still there. So a failure in the middle leaves a tree that is neither
+/// state, and the only honest thing to do is say so — and try to undo it.
+///
+/// `recovered` is the difference between "your files are as they were" and
+/// "your files are between two states, here is how to get back".
+#[derive(Debug)]
+pub struct RestoreFailed {
+    pub recovered: bool,
+    /// The checkpoint holding the state from before the attempt, when one was
+    /// taken. Restoring it is the way back.
+    pub checkpoint_seq: Option<u64>,
+    pub cause: String,
+    /// Set when putting the tree back failed as well.
+    pub recovery_error: Option<String>,
+}
+
+impl std::fmt::Display for RestoreFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the restore failed: {}", self.cause)?;
+        if self.recovered {
+            return write!(f, ". Your files were put back as they were.");
+        }
+        write!(f, ". Your working tree is between two states")?;
+        if let Some(err) = &self.recovery_error {
+            write!(f, ", and putting it back failed too ({err})")?;
+        }
+        match self.checkpoint_seq {
+            Some(seq) => write!(f, " — `sheep restore #{seq} --yes` returns it to how it was."),
+            None => write!(f, "."),
+        }
+    }
+}
+
+impl std::error::Error for RestoreFailed {}
+
 #[derive(Debug)]
 pub struct Restored {
     pub plan: RestorePlan,
@@ -205,7 +244,25 @@ pub fn restore_expecting(
         true,
     )?;
 
-    shadow.apply(&plan)?;
+    if let Err(cause) = shadow.apply(&plan) {
+        // The checkpoint tree is exactly what was on disk a moment ago, so a
+        // plan from here to there is precisely the repair. Attempt it before
+        // reporting anything: a user should have to think about a half-applied
+        // tree only when we genuinely could not undo it.
+        let mut failure = RestoreFailed {
+            recovered: false,
+            checkpoint_seq: checkpoint.as_ref().map(|c| c.seq),
+            cause: format!("{cause:#}"),
+            recovery_error: None,
+        };
+        if let Some(cp) = &checkpoint {
+            match shadow.plan(&cp.tree).and_then(|back| shadow.apply(&back)) {
+                Ok(()) => failure.recovered = true,
+                Err(e) => failure.recovery_error = Some(format!("{e:#}")),
+            }
+        }
+        return Err(failure.into());
+    }
 
     // Record where we landed, so the timeline always describes what is on disk.
     snap(

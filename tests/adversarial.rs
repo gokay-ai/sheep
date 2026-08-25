@@ -957,3 +957,57 @@ fn a_path_that_became_a_directory_under_the_plan_is_refused() {
     assert!(err.to_string().contains("later.txt"), "the refusal should name it: {err}");
     assert!(f.exists("later.txt/surprise.txt"), "its contents must survive");
 }
+
+#[test]
+fn a_restore_that_fails_partway_puts_the_tree_back() {
+    // `apply` removes before it writes, and it has to — a path changing between
+    // a file and a directory cannot be written while the old shape is there. So
+    // a failure in the middle leaves a tree that is neither state. Claiming
+    // "nothing was written" at that point is the most dangerous thing the
+    // software could say, so it recovers first and tells the truth either way.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let f = Fixture::new();
+        f.write("keep/x.txt", "original\n");
+        f.write("gone.txt", "here at the target\n");
+        f.commit_all("base");
+        let target = f.snap("turn 1");
+
+        fs::remove_file(f.repo.join("gone.txt")).unwrap();
+        f.write("keep/x.txt", "the agent changed this\n");
+        f.snap("turn 2");
+
+        // The plan writes into keep/ and removes nothing outside it; making the
+        // directory read-only fails the write after the removals have run.
+        let locked = f.repo.join("keep");
+        let original = fs::metadata(&locked).unwrap().permissions();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o555)).unwrap();
+
+        let err = ops::restore(&f.wt(), &f.state, "default", &target.to_string(), BUDGET)
+            .expect_err("a write into a read-only directory must fail");
+
+        fs::set_permissions(&locked, original).unwrap();
+
+        let failed = err
+            .downcast_ref::<ops::RestoreFailed>()
+            .unwrap_or_else(|| panic!("a partial restore must be reported as one: {err:#}"));
+        assert!(
+            failed.recovered,
+            "the tree should have been put back; instead: {}",
+            err
+        );
+        assert!(
+            failed.checkpoint_seq.is_some(),
+            "the way back has to be nameable even when recovery worked"
+        );
+
+        // The agent's work is exactly as it was before the attempt.
+        assert_eq!(f.read("keep/x.txt"), "the agent changed this\n");
+        assert!(!f.exists("gone.txt"), "a file the restore had removed must be back to absent");
+        assert!(
+            !err.to_string().contains("nothing was written"),
+            "the message must never claim nothing happened: {err}"
+        );
+    }
+}
