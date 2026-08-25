@@ -432,13 +432,24 @@ fn collect_locked(
 ) -> Result<Collected> {
     let shadow = Shadow::ensure(wt.clone(), state)?;
     let store = Store::open(state, &wt.id, line)?;
-    let turns = store.all()?;
-    // The ref as it stood when those turns were read. Under the lock it cannot
-    // move; passing it to `rechain` anyway means that if it ever does — an
-    // older Sheep beside this one, or a lock broken while this process was
-    // frozen — the rewrite is refused rather than silently dropping whatever
-    // was recorded in between.
+
+    // The ref first, the log second, and the order is the whole point.
+    //
+    // These two reads are what `rechain`'s compare-and-swap compares against.
+    // Under the lock nothing can move between them; the swap is there for when
+    // the lock is not genuinely held — an older Sheep alongside, or a lock
+    // broken as stale while this process was frozen — which is the only case it
+    // can ever fire in, so it has to be right in exactly that case.
+    //
+    // Read the log first and a turn appended between the two reads is missing
+    // from `turns` but already reflected in `head_before`. The swap then
+    // *succeeds*, and the rewrite drops that turn from the log and prunes the
+    // objects behind it — silently, which is the precise failure it exists to
+    // refuse. Read the ref first and the same turn is in `turns` and leaves the
+    // ref ahead of `head_before`: it is kept, or the collection refuses. Either
+    // way it survives.
     let head_before = shadow.head(line)?;
+    let turns = store.all()?;
 
     let mut report = Collected {
         line: line.to_string(),

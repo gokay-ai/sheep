@@ -32,10 +32,18 @@
 //! `create_new` on a file under `<state>/locks/`, which is atomic on every
 //! filesystem Sheep targets and needs no C dependency. The holder writes a
 //! token identifying itself and re-stamps the file every [`BEAT`]; a lock whose
-//! file has not been touched for [`STALE_AFTER`] is debris left by a killed
-//! process and is broken by whoever notices, atomically, with a rename. A
-//! killed recorder therefore wedges nothing for longer than half a minute, and
-//! a live holder cannot have its lock taken while it is still beating.
+//! file has not been stamped within [`STALE_AFTER`] — in *either* direction, so
+//! that a clock which ran backwards cannot leave a file no heartbeat will ever
+//! catch up with — is debris left by a killed process, and is broken by whoever
+//! notices, atomically, with a rename. A killed recorder therefore wedges
+//! nothing for longer than half a minute, and a live holder cannot have its
+//! lock taken while it is still beating — on clocks that agree to within that
+//! window, which two processes on one machine sharing one state directory do.
+//!
+//! Nothing here ever blocks for ever, and that is a property of the loop rather
+//! than of the happy path: every way round it reaches the deadline check, so a
+//! rename that cannot succeed ends in [`Busy`] like any other contention rather
+//! than in a spinning core.
 
 use anyhow::{Context, Result};
 use std::fs::OpenOptions;
@@ -78,7 +86,7 @@ impl std::fmt::Display for Busy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "another Sheep process is writing this worktree's history ({}) and did not finish within {:.0}s. Nothing was changed; try again.",
+            "another Sheep process is writing this worktree's history ({}) and did not finish within {:.1}s. Nothing was changed; try again.",
             self.holder,
             self.waited.as_secs_f64()
         )
@@ -156,11 +164,15 @@ pub fn hold(state: &Path, worktree_id: &str, wait: Duration) -> Result<Guard> {
         // Held. Debris from a process that died still looks exactly like this,
         // and the only thing that tells them apart is whether anyone is still
         // stamping the file.
-        if age(&path).is_some_and(|age| age > STALE_AFTER) {
-            break_stale(&path, &token);
-            continue;
-        }
+        let freed = is_stale(&path) && break_stale(&path, &token);
 
+        // Every path through this loop reaches here, and this is the reason
+        // `break_stale` reports whether it worked. Skipping the deadline to go
+        // round again is only safe if something actually changed: a rename that
+        // cannot succeed — a read-only state directory, a file somebody made
+        // immutable — would otherwise spin a core until the process is killed.
+        // That is worse than the stall the whole design gives up a turn to
+        // avoid, and the module says plainly that it cannot happen.
         let waited = started.elapsed();
         if waited >= wait {
             return Err(Busy {
@@ -170,7 +182,9 @@ pub fn hold(state: &Path, worktree_id: &str, wait: Duration) -> Result<Guard> {
             }
             .into());
         }
-        std::thread::sleep(POLL.min(wait.saturating_sub(waited)));
+        if !freed {
+            std::thread::sleep(POLL.min(wait.saturating_sub(waited)));
+        }
     }
 }
 
@@ -195,25 +209,45 @@ fn heartbeat(path: PathBuf, token: String, stopped: Receiver<()>) {
     }
 }
 
-/// Remove a lock file nobody is stamping any more.
+/// Remove a lock file nobody is stamping any more. Reports whether it went.
 ///
 /// Through a rename, because two waiters can notice the same debris at the same
 /// moment: the rename picks exactly one winner, and the loser simply goes round
 /// again and finds the lock free — rather than both deleting, both creating,
 /// and both believing they hold it.
-fn break_stale(path: &Path, token: &str) {
+///
+/// The answer matters to the caller. `false` means nothing changed, and going
+/// round again without waiting would be a spin.
+fn break_stale(path: &Path, token: &str) -> bool {
     let debris = path.with_extension(format!("stale-{token}"));
-    if std::fs::rename(path, &debris).is_ok() {
-        let _ = std::fs::remove_file(&debris);
+    if std::fs::rename(path, &debris).is_err() {
+        return false;
     }
+    let _ = std::fs::remove_file(&debris);
+    true
 }
 
-/// How long since the lock file was last stamped. `None` when it is gone, or
-/// when its timestamp is in the future — a clock that jumped must not be a
-/// reason to break a live lock.
-fn age(path: &Path) -> Option<Duration> {
-    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
-    SystemTime::now().duration_since(modified).ok()
+/// Whether the lock file has gone long enough without a stamp to be debris.
+///
+/// Both directions count. A stamp far in the *future* is not evidence of a live
+/// holder — a heartbeat cannot reach it, so the file would never age out and
+/// the worktree could never be recorded into again. A backwards clock step from
+/// NTP, a resumed VM, or a state directory on a filesystem whose clock runs
+/// ahead all produce exactly that, and only a human deleting the file by hand
+/// would recover it. So a lead of more than [`STALE_AFTER`] is treated the same
+/// as a lag of more than [`STALE_AFTER`].
+///
+/// A small lead is left alone: two clocks a second or two apart is ordinary,
+/// and a holder stamping every [`BEAT`] under such a clock is alive.
+fn is_stale(path: &Path) -> bool {
+    let Some(modified) = std::fs::metadata(path).ok().and_then(|m| m.modified().ok()) else {
+        // Gone between the failed create and now. Not debris — just go round.
+        return false;
+    };
+    match SystemTime::now().duration_since(modified) {
+        Ok(age) => age > STALE_AFTER,
+        Err(ahead) => ahead.duration() > STALE_AFTER,
+    }
 }
 
 fn holder(path: &Path) -> Option<String> {
@@ -293,12 +327,100 @@ mod tests {
         let path = state.path().join("locks").join("w.lock");
         filetime(&path, SystemTime::now() - (STALE_AFTER + Duration::from_secs(5)));
         std::thread::sleep(BEAT + Duration::from_millis(500));
-        assert!(
-            age(&path).is_some_and(|age| age < STALE_AFTER),
-            "a live holder must keep its lock fresh"
-        );
+        assert!(!is_stale(&path), "a live holder must keep its lock fresh");
         hold(state.path(), "w", Duration::from_millis(50))
             .expect_err("a lock being stamped must not be broken");
+    }
+
+    #[test]
+    fn a_lock_stamped_in_the_future_is_still_breakable() {
+        // A backwards clock step — an NTP correction, a resumed VM — leaves
+        // debris whose timestamp no heartbeat can ever reach. Reading that as
+        // "somebody is holding it" wedges the worktree for good: nothing
+        // records into it again until a human works out which file to delete,
+        // and nothing tells them that is what happened.
+        let state = dir();
+        let locks = state.path().join("locks");
+        std::fs::create_dir_all(&locks).unwrap();
+        let path = locks.join("w.lock");
+        std::fs::write(&path, "pid 999999 · from a clock that ran ahead").unwrap();
+        filetime(&path, SystemTime::now() + Duration::from_secs(3600));
+
+        let taken = hold(state.path(), "w", Duration::from_millis(300))
+            .expect("a lock stamped in the future must not wedge the worktree for ever");
+        assert_eq!(taken.path(), path);
+    }
+
+    #[test]
+    fn a_clock_a_second_or_two_ahead_is_not_a_dead_holder() {
+        // The other side of it. Two clocks rarely agree exactly, and a holder
+        // stamping every `BEAT` under a slightly fast one is alive — breaking
+        // its lock would put two writers in the state directory, which is the
+        // thing this module exists to prevent.
+        let state = dir();
+        let locks = state.path().join("locks");
+        std::fs::create_dir_all(&locks).unwrap();
+        let path = locks.join("w.lock");
+        std::fs::write(&path, "pid 4242 · alive, on a slightly fast clock").unwrap();
+        filetime(&path, SystemTime::now() + Duration::from_secs(2));
+
+        assert!(!is_stale(&path), "a small lead is a live holder, not debris");
+        hold(state.path(), "w", Duration::from_millis(80))
+            .expect_err("a live holder's lock must not be taken");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_lock_that_cannot_be_broken_gives_up_instead_of_spinning() {
+        // Debris that is there but cannot be removed: a read-only state
+        // directory, a file someone made immutable, a filesystem that has gone
+        // read-only under us. Going round again without honouring the deadline
+        // turns "wait five seconds and skip the turn" into a core spinning
+        // until the process is killed — worse than the stall the whole design
+        // gives up a turn to avoid.
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::mpsc;
+
+        let state = dir();
+        let locks = state.path().join("locks");
+        std::fs::create_dir_all(&locks).unwrap();
+        let path = locks.join("w.lock");
+        std::fs::write(&path, "pid 999999 · long gone").unwrap();
+        filetime(&path, SystemTime::now() - (STALE_AFTER + Duration::from_secs(5)));
+
+        // A directory nothing may be renamed within.
+        std::fs::set_permissions(&locks, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let restore = |mode| {
+            let _ = std::fs::set_permissions(&locks, std::fs::Permissions::from_mode(mode));
+        };
+        if std::fs::rename(&path, locks.join("probe")).is_ok() {
+            // Running as root, where permissions do not bind. Nothing to test.
+            let _ = std::fs::rename(locks.join("probe"), &path);
+            restore(0o755);
+            return;
+        }
+
+        // On another thread, so that a `hold` which never returns fails this
+        // test with a message rather than hanging the suite.
+        let (tx, rx) = mpsc::channel();
+        let dir_path = state.path().to_path_buf();
+        std::thread::spawn(move || {
+            let outcome = hold(&dir_path, "w", Duration::from_millis(200));
+            let _ = tx.send(outcome.err().map(|e| e.downcast::<Busy>().is_ok()));
+        });
+
+        let answer = rx.recv_timeout(Duration::from_secs(5));
+        // Before any assertion: a stuck thread is still spinning on this
+        // directory, and restoring it lets it finish and the tempdir clean up.
+        restore(0o755);
+        match answer {
+            Ok(Some(true)) => {}
+            Ok(Some(false)) => panic!("contention must be reported as `Busy`"),
+            Ok(None) => panic!("the lock must not have been handed out"),
+            Err(_) => panic!(
+                "hold() never returned: it is spinning on a rename it cannot do instead of honouring its deadline"
+            ),
+        }
     }
 
     /// Backdate a file's modification time. No `filetime` crate and no C

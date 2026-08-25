@@ -299,3 +299,38 @@ fn a_collection_and_a_snapshot_do_not_interleave_their_refs() {
         );
     }
 }
+
+/// A collection that finds the ref somewhere other than where it read it
+/// refuses, rather than pointing the ref at a chain that does not contain
+/// whatever moved it.
+///
+/// This is the compare-and-swap on its own. Under the lock it cannot fire; it
+/// is here for the case where the lock is not genuinely held, which is also the
+/// only case where losing the turn would be silent.
+#[test]
+fn a_rebuilt_timeline_refuses_a_ref_that_moved_under_it() {
+    let f = Fixture::new();
+    f.write("a.txt", "one\n");
+    let first = f.snap("turn 1");
+
+    let shadow = Shadow::ensure(f.wt(), &f.state).unwrap();
+    let read_at = shadow.head(LINE).unwrap();
+
+    // Somebody records after that read.
+    f.write("a.txt", "two\n");
+    let second = f.snap("turn 2");
+
+    let chain = vec![(first.tree.clone(), first.subject(), first.at)];
+    let err = shadow
+        .rechain(LINE, &chain, read_at.as_deref())
+        .expect_err("a ref that moved must not be swapped away");
+    assert!(
+        format!("{err:#}").contains("moved while Sheep was writing to it"),
+        "the refusal must say what happened: {err:#}"
+    );
+    assert_eq!(
+        shadow.head(LINE).unwrap().as_deref(),
+        Some(second.commit.as_str()),
+        "and the ref must be left exactly where the other writer put it"
+    );
+}
