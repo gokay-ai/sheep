@@ -395,6 +395,23 @@ fn run(herdr: &Herdr, state: &Path, dry_run: bool, steps: Vec<Step>) -> Recorder
     recorder
 }
 
+/// The same, with a patience ceiling far beyond anything the machine can do to
+/// the schedule.
+///
+/// `PATIENCE_MS` is 500 so that the tests about *giving up* do not take a
+/// minute each, and it is a ceiling on the whole corroboration — retries
+/// included. A test whose subject is what happens across two settle windows is
+/// then two things at once: the check it means to exercise, and a race against
+/// that ceiling, which a loaded machine can win. Where the ceiling is not the
+/// subject, take it out of the picture.
+fn run_patient(herdr: &Herdr, state: &Path, steps: Vec<Step>) -> Recorder<Herdr> {
+    let mut config = config(state, false);
+    config.tuning.patience = Duration::from_secs(30);
+    let mut recorder = Recorder::new(herdr.clone(), config, Log::to_stdout());
+    let _ = recorder.pump(&mut Script::new(steps));
+    recorder
+}
+
 /// The same, with the periodic re-sync actually firing. The default config
 /// pushes it an hour out so it never interferes; a test about what reconcile
 /// does to cached state needs it to run.
@@ -531,7 +548,7 @@ fn a_turn_filed_while_the_agent_was_still_writing_holds_the_wrong_tree() {
     steps.push(edit(repo.join("src.rs"), "fn main() { /* finished */ }\n"));
     steps.push(Step::Rest(SETTLE_MS * 3));
 
-    run(&herdr, &ground.state, false, steps);
+    run_patient(&herdr, &ground.state, steps);
 
     let turns = ground.recorded(&repo, "claude");
     assert_eq!(turns.len(), 1, "the turn lands once the process group settles: {turns:?}");
@@ -544,7 +561,8 @@ fn a_turn_filed_while_the_agent_was_still_writing_holds_the_wrong_tree() {
         sheep::ops::plan(&wt, &ground.state, "claude", &turns[0].seq.to_string(), BUDGET).unwrap();
     assert!(
         planned.plan.is_noop(),
-        "the recorded turn is a tree the agent was halfway through writing: restoring it would change {:?}",
+        "#{} is a tree the agent was halfway through writing: restoring it would change {:?}",
+        turns[0].seq,
         planned.plan.write
     );
 }
@@ -575,7 +593,9 @@ fn a_turn_is_not_filed_for_a_program_that_is_no_longer_there() {
     // to arrive.
     steps.push(Step::Rest(SETTLE_MS * 3));
 
-    let recorder = run(&herdr, &ground.state, false, steps);
+    // Patient, so that running out of patience is not what produces the
+    // answer: the point is that the turn is dropped on its merits.
+    let recorder = run_patient(&herdr, &ground.state, steps);
 
     assert!(
         ground.recorded(&repo, "claude").is_empty(),
