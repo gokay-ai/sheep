@@ -616,3 +616,50 @@ fn the_first_turn_reports_the_size_of_the_tree() {
     .unwrap();
     assert_eq!(turn.files, 2, "a baseline turn should describe what it captured, not `0 files`");
 }
+
+#[test]
+fn a_herdr_pane_id_can_name_a_timeline() {
+    // Regression: timelines are named after the pane that produced them, and a
+    // herdr pane id looks like `w31:pW`. The colon is illegal in a git ref, so
+    // recording under a pane id used to fail with
+    // "refusing to update ref with bad name" — which meant the recorder could
+    // not record the one thing it exists to record.
+    let f = Fixture::new();
+    f.write("a.txt", "one\n");
+    f.commit_all("base");
+
+    let line = "w31:pW";
+    let first = ops::snap(
+        &f.wt(),
+        &f.state,
+        line,
+        BUDGET,
+        TurnKind::Turn,
+        SnapMeta { pane_id: Some(line.into()), ..Default::default() },
+        false,
+    )
+    .expect("a pane id must be usable as a timeline name")
+    .expect("the first turn should record");
+
+    f.write("a.txt", "two\n");
+    ops::snap(&f.wt(), &f.state, line, BUDGET, TurnKind::Turn, SnapMeta::default(), false)
+        .unwrap()
+        .unwrap();
+
+    ops::restore(&f.wt(), &f.state, line, &first.seq.to_string(), BUDGET).unwrap();
+    assert_eq!(f.read("a.txt"), "one\n");
+
+    // And it must not collide with the timeline of a differently-spelled pane.
+    let other = ops::snap(
+        &f.wt(),
+        &f.state,
+        "w31/pW",
+        BUDGET,
+        TurnKind::Turn,
+        SnapMeta::default(),
+        false,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(other.seq, 1, "a different timeline must start its own numbering");
+}

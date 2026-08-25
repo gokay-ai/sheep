@@ -210,8 +210,13 @@ impl Shadow {
         Ok(Snapshot { commit, tree: tree.to_string(), parent, at })
     }
 
+    /// The ref a timeline records onto.
+    ///
+    /// Goes through the same slug as the turn log, because a herdr pane id
+    /// contains a colon and git refuses it outright — and because the two must
+    /// never disagree about which timeline a pane owns.
     fn ref_name(line: &str) -> String {
-        format!("refs/sheep/{line}")
+        format!("refs/sheep/{}", crate::store::slug(line))
     }
 
     pub fn head(&self, line: &str) -> Result<Option<String>> {

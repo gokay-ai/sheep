@@ -7,6 +7,7 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -85,7 +86,7 @@ impl Store {
         let dir = state_dir.join("turns").join(worktree_id);
         std::fs::create_dir_all(&dir)
             .with_context(|| format!("cannot create {}", dir.display()))?;
-        Ok(Self { path: dir.join(format!("{}.ndjson", sanitize(line))) })
+        Ok(Self { path: dir.join(format!("{}.ndjson", slug(line))) })
     }
 
     pub fn path(&self) -> &Path {
@@ -129,10 +130,90 @@ impl Store {
     }
 }
 
-fn sanitize(s: &str) -> String {
-    let cleaned: String = s
+/// A timeline name reduced to something both a filesystem and a git ref accept.
+///
+/// A timeline has to name two things: a file in the turn log and a ref in the
+/// shadow repository. Herdr pane ids — the natural timeline name when an agent
+/// is being recorded — contain a colon, which git flatly refuses in a ref name:
+///
+/// ```text
+/// fatal: update_ref failed for ref 'refs/sheep/w31:pW': refusing to update ref with bad name
+/// ```
+///
+/// So everything outside `[A-Za-z0-9_-]` becomes `-`. That mapping is lossy, so
+/// a name that had to be changed carries a short digest of the original: two
+/// different timelines can then never collapse onto the same ref, which would
+/// silently interleave two agents' histories.
+///
+/// Both [`Store`] and the shadow repository call this, so they cannot disagree
+/// about which timeline a pane owns.
+pub fn slug(line: &str) -> String {
+    let cleaned: String = line
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
         .collect();
-    if cleaned.is_empty() { "default".into() } else { cleaned }
+    if cleaned.is_empty() {
+        return "default".into();
+    }
+    // Only names that are already legal pass through unchanged. A leading dash
+    // is excluded even when nothing else had to be rewritten, because a bare
+    // `-name` is read as a flag by half the commands that will ever see it.
+    if cleaned == line && !cleaned.starts_with('-') {
+        return cleaned;
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(line.as_bytes());
+    let digest = hasher.finalize();
+    let suffix: String = digest.iter().take(3).map(|b| format!("{b:02x}")).collect();
+    // A name made entirely of separators trims to nothing, and a ref or a
+    // filename beginning with `-` is a trap for every command that takes flags.
+    let base = match cleaned.trim_matches('-') {
+        "" => "line",
+        base => base,
+    };
+    format!("{base}-{suffix}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::slug;
+
+    #[test]
+    fn a_plain_name_is_left_alone() {
+        assert_eq!(slug("default"), "default");
+        assert_eq!(slug("my_line-2"), "my_line-2");
+    }
+
+    #[test]
+    fn a_herdr_pane_id_becomes_a_legal_git_ref() {
+        // The colon is what git rejects; this is the case that matters.
+        let s = slug("w31:pW");
+        assert!(s.starts_with("w31-pW-"), "expected a sanitised pane id, got {s}");
+        assert!(!s.contains(':'));
+    }
+
+    #[test]
+    fn two_names_that_clean_to_the_same_thing_stay_apart() {
+        // Without the digest these would both be `w3-p1` and two agents would
+        // write into one history.
+        assert_ne!(slug("w3:p1"), slug("w3/p1"));
+        assert_ne!(slug("w3:p1"), "w3-p1");
+    }
+
+    #[test]
+    fn a_name_made_of_separators_still_produces_a_usable_ref() {
+        assert_eq!(slug(""), "default");
+        for awkward in ["///", "-", "...", "@{"] {
+            let s = slug(awkward);
+            assert!(!s.is_empty(), "{awkward:?} produced an empty slug");
+            assert!(
+                !s.starts_with('-'),
+                "{awkward:?} produced {s:?}, and a leading dash is a trap for every command that takes flags"
+            );
+            assert!(
+                s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+                "{awkward:?} produced {s:?}, which git will not accept as a ref"
+            );
+        }
+    }
 }
