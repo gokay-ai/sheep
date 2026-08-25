@@ -67,8 +67,9 @@ impl std::error::Error for ApiError {}
 
 #[cfg(unix)]
 fn connect() -> Result<UnixStream> {
-    let path = socket_path()
-        .ok_or_else(|| anyhow!("HERDR_SOCKET_PATH is not set: Sheep is not running inside herdr"))?;
+    let path = socket_path().ok_or_else(|| {
+        anyhow!("HERDR_SOCKET_PATH is not set: Sheep is not running inside herdr")
+    })?;
     let stream = UnixStream::connect(&path)
         .with_context(|| format!("cannot reach the herdr session at {}", path.display()))?;
     stream.set_read_timeout(Some(REQUEST_TIMEOUT))?;

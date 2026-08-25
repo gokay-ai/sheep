@@ -118,7 +118,8 @@ fn run() -> Result<()> {
                 note: note.clone(),
                 prompt: None,
             };
-            match ops::snap(&wt, &state, line, cli.max_files, TurnKind::Manual, meta, *allow_empty)? {
+            match ops::snap(&wt, &state, line, cli.max_files, TurnKind::Manual, meta, *allow_empty)?
+            {
                 Some(turn) => println!("{}  {}", ops::short(&turn.commit), turn.subject()),
                 None => println!("nothing changed since the last turn"),
             }
@@ -165,7 +166,9 @@ fn run() -> Result<()> {
             let done = ops::restore(&wt, &state, line, target, cli.max_files)?;
             println!("\nrestored {} path(s).", done.plan.touched());
             if let Some(note) = &done.bookkeeping_error {
-                println!("note: your files are restored, but recording the new turn failed ({note}).");
+                println!(
+                    "note: your files are restored, but recording the new turn failed ({note})."
+                );
             }
             if let Some(cp) = done.checkpoint {
                 println!(
@@ -236,7 +239,11 @@ fn human(bytes: u64) -> String {
         value /= 1024.0;
         unit += 1;
     }
-    if unit == 0 { format!("{bytes} B") } else { format!("{value:.1} {}", UNITS[unit]) }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
 }
 
 fn print_plan(plan: &RestorePlan, commit: &str) {

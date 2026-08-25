@@ -38,15 +38,21 @@ impl Worktree {
             bail!("{} is a bare repository: there is no working tree to restore.", start.display());
         }
 
-        let root = canonical(Path::new(
-            &git.run(&["rev-parse", "--path-format=absolute", "--show-toplevel"])?,
-        ))?;
-        let git_dir = canonical(Path::new(
-            &git.run(&["rev-parse", "--path-format=absolute", "--git-dir"])?,
-        ))?;
-        let common_dir = canonical(Path::new(
-            &git.run(&["rev-parse", "--path-format=absolute", "--git-common-dir"])?,
-        ))?;
+        let root = canonical(Path::new(&git.run(&[
+            "rev-parse",
+            "--path-format=absolute",
+            "--show-toplevel",
+        ])?))?;
+        let git_dir = canonical(Path::new(&git.run(&[
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-dir",
+        ])?))?;
+        let common_dir = canonical(Path::new(&git.run(&[
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-common-dir",
+        ])?))?;
 
         let id = worktree_id(&root);
         Ok(Self { root, git_dir, common_dir, id })
@@ -262,7 +268,8 @@ pub fn state_dir() -> Result<PathBuf> {
     let base = if let Ok(xdg) = std::env::var("XDG_STATE_HOME") {
         PathBuf::from(xdg)
     } else {
-        let home = std::env::var("HOME").context("neither HERDR_PLUGIN_STATE_DIR nor HOME is set")?;
+        let home =
+            std::env::var("HOME").context("neither HERDR_PLUGIN_STATE_DIR nor HOME is set")?;
         PathBuf::from(home).join(".local").join("state")
     };
     Ok(base.join("sheep"))

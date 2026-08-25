@@ -110,11 +110,8 @@ impl Shadow {
         if let Ok(existing) = std::fs::read_to_string(&upstream) {
             for line in existing.lines().map(str::trim).filter(|l| !l.is_empty()) {
                 let path = PathBuf::from(line);
-                let resolved = if path.is_absolute() {
-                    path
-                } else {
-                    self.worktree.objects_dir().join(path)
-                };
+                let resolved =
+                    if path.is_absolute() { path } else { self.worktree.objects_dir().join(path) };
                 lines.push(resolved.display().to_string());
             }
         }
@@ -198,7 +195,13 @@ impl Shadow {
     /// Write a commit object. Author and committer are pinned so Sheep works on
     /// a machine with no `user.email`, and the date is passed in so a rewritten
     /// history keeps the times the turns actually happened.
-    fn commit_tree(&self, tree: &str, parent: Option<&str>, message: &str, at: u64) -> Result<String> {
+    fn commit_tree(
+        &self,
+        tree: &str,
+        parent: Option<&str>,
+        message: &str,
+        at: u64,
+    ) -> Result<String> {
         let mut args: Vec<String> = vec!["commit-tree".into(), tree.into()];
         if let Some(p) = parent {
             args.push("-p".into());
@@ -277,7 +280,8 @@ impl Shadow {
     }
 
     pub fn head(&self, line: &str) -> Result<Option<String>> {
-        let out = self.git().output(&["rev-parse", "--verify", "--quiet", &Self::ref_name(line)])?;
+        let out =
+            self.git().output(&["rev-parse", "--verify", "--quiet", &Self::ref_name(line)])?;
         if !out.status.success() {
             return Ok(None);
         }
@@ -288,9 +292,15 @@ impl Shadow {
     /// Resolve a user-supplied reference: a full or short commit id, a line
     /// head, or `<line>~N` / `<line>@{N}` style ancestry.
     pub fn resolve(&self, line: &str, spec: &str) -> Result<String> {
-        let candidates = [spec.to_string(), Self::ref_name(spec), format!("{}~{spec}", Self::ref_name(line))];
+        let candidates =
+            [spec.to_string(), Self::ref_name(spec), format!("{}~{spec}", Self::ref_name(line))];
         for candidate in candidates.iter() {
-            let out = self.git().output(&["rev-parse", "--verify", "--quiet", &format!("{candidate}^{{commit}}")])?;
+            let out = self.git().output(&[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("{candidate}^{{commit}}"),
+            ])?;
             if out.status.success() {
                 let oid = String::from_utf8_lossy(&out.stdout).trim().to_string();
                 if !oid.is_empty() {
@@ -449,12 +459,9 @@ impl Shadow {
             let _ = std::fs::remove_file(&index);
             let git = self.git().with_index(&index);
             git.run(&["read-tree", &plan.target_tree])?;
-            let input = plan
-                .write
-                .iter()
-                .map(|p| format!("{p}\0"))
-                .collect::<String>();
-            let out = git.run_stdin(&["checkout-index", "-f", "-u", "--stdin", "-z"], input.as_bytes())?;
+            let input = plan.write.iter().map(|p| format!("{p}\0")).collect::<String>();
+            let out =
+                git.run_stdin(&["checkout-index", "-f", "-u", "--stdin", "-z"], input.as_bytes())?;
             if !out.status.success() {
                 bail!(
                     "restore failed while writing files: {}",

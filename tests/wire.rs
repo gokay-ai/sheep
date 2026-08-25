@@ -123,11 +123,9 @@ fn a_subscription_acknowledges_then_streams_events() {
     );
 
     let (first, second, sent) = with_socket(&path, || {
-        let mut sub = Subscription::open(&[
-            wire::topic("pane.created"),
-            wire::topic_agent_status("w1:p2"),
-        ])
-        .expect("the acknowledgement should be accepted");
+        let mut sub =
+            Subscription::open(&[wire::topic("pane.created"), wire::topic_agent_status("w1:p2")])
+                .expect("the acknowledgement should be accepted");
         let first = sub.next_event().unwrap().unwrap();
         let second = sub.next_event().unwrap().unwrap();
         (first, second, seen.recv().unwrap())
@@ -149,7 +147,8 @@ fn a_subscription_acknowledges_then_streams_events() {
 fn a_subscription_refuses_an_unexpected_acknowledgement() {
     let (_dir, path, _seen) =
         fake_server(vec![json!({"id": "x", "result": {"type": "pong"}})], true);
-    let err = with_socket(&path, || Subscription::open(&[wire::topic("pane.created")])).unwrap_err();
+    let err =
+        with_socket(&path, || Subscription::open(&[wire::topic("pane.created")])).unwrap_err();
     assert!(
         err.to_string().contains("subscription_started"),
         "the mismatch should be explicit: {err}"

@@ -350,9 +350,8 @@ pub fn collect(
         return Ok(report);
     }
 
-    let cutoff = policy
-        .max_age_days
-        .map(|days| shadow::now().saturating_sub(days.saturating_mul(86_400)));
+    let cutoff =
+        policy.max_age_days.map(|days| shadow::now().saturating_sub(days.saturating_mul(86_400)));
     let floor = turns.len().saturating_sub(policy.keep.max(1));
 
     let kept: Vec<Turn> = turns

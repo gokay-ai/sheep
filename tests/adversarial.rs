@@ -169,7 +169,11 @@ fn a_restore_is_itself_undoable() {
 
     let checkpoint = done.checkpoint.expect("a checkpoint must be recorded before restoring");
     f.restore(checkpoint.seq);
-    assert_eq!(f.read("a.txt"), "two\n", "restoring the checkpoint must put the replaced state back");
+    assert_eq!(
+        f.read("a.txt"),
+        "two\n",
+        "restoring the checkpoint must put the replaced state back"
+    );
 }
 
 #[test]
@@ -179,16 +183,9 @@ fn an_unchanged_tree_is_not_recorded_twice() {
     f.commit_all("base");
     f.snap("turn 1");
 
-    let repeat = ops::snap(
-        &f.wt(),
-        &f.state,
-        "default",
-        BUDGET,
-        TurnKind::Turn,
-        SnapMeta::default(),
-        false,
-    )
-    .expect("snap should succeed");
+    let repeat =
+        ops::snap(&f.wt(), &f.state, "default", BUDGET, TurnKind::Turn, SnapMeta::default(), false)
+            .expect("snap should succeed");
     assert!(repeat.is_none(), "an agent turn that changed nothing must not create a turn");
 }
 
@@ -310,15 +307,8 @@ fn refuses_a_worktree_with_unresolved_conflicts() {
         health.blockers
     );
 
-    let attempt = ops::snap(
-        &f.wt(),
-        &f.state,
-        "default",
-        BUDGET,
-        TurnKind::Turn,
-        SnapMeta::default(),
-        false,
-    );
+    let attempt =
+        ops::snap(&f.wt(), &f.state, "default", BUDGET, TurnKind::Turn, SnapMeta::default(), false);
     assert!(attempt.is_err(), "snapshotting a conflicted tree must fail loudly");
 }
 
@@ -403,10 +393,7 @@ fn refuses_to_restore_a_snapshot_with_a_missing_object() {
         .shadow
         .apply(&planned.plan)
         .expect_err("restoring an incomplete snapshot must fail");
-    assert!(
-        err.to_string().contains("incomplete"),
-        "the refusal should name the problem: {err}"
-    );
+    assert!(err.to_string().contains("incomplete"), "the refusal should name the problem: {err}");
     assert_eq!(f.read("a.txt"), "two\n", "a refused restore must not have written anything");
 }
 
@@ -438,11 +425,8 @@ fn handles_a_linked_worktree_and_borrows_the_main_object_database() {
     ops::restore(&wt, &f.state, "default", &first.to_string(), BUDGET).unwrap();
     assert_eq!(fs::read_to_string(linked.join("a.txt")).unwrap(), "main\n");
 
-    let alternates = f
-        .state
-        .join("shadow")
-        .join(format!("{}.git", wt.id))
-        .join("objects/info/alternates");
+    let alternates =
+        f.state.join("shadow").join(format!("{}.git", wt.id)).join("objects/info/alternates");
     let body = fs::read_to_string(alternates).unwrap();
     assert!(
         body.contains(wt.objects_dir().to_str().unwrap()),
@@ -528,7 +512,15 @@ fn reports_submodules_as_a_warning_rather_than_failing() {
     f.commit_all("base");
     git(
         &f.repo,
-        &["-c", "protocol.file.allow=always", "submodule", "--quiet", "add", inner.to_str().unwrap(), "vendor/dep"],
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "--quiet",
+            "add",
+            inner.to_str().unwrap(),
+            "vendor/dep",
+        ],
     );
     f.commit_all("add submodule");
 
@@ -603,17 +595,10 @@ fn the_first_turn_reports_the_size_of_the_tree() {
     f.write("b/c.txt", "two\n");
     f.commit_all("base");
 
-    let turn = ops::snap(
-        &f.wt(),
-        &f.state,
-        "default",
-        BUDGET,
-        TurnKind::Turn,
-        SnapMeta::default(),
-        false,
-    )
-    .unwrap()
-    .unwrap();
+    let turn =
+        ops::snap(&f.wt(), &f.state, "default", BUDGET, TurnKind::Turn, SnapMeta::default(), false)
+            .unwrap()
+            .unwrap();
     assert_eq!(turn.files, 2, "a baseline turn should describe what it captured, not `0 files`");
 }
 
@@ -650,17 +635,10 @@ fn a_herdr_pane_id_can_name_a_timeline() {
     assert_eq!(f.read("a.txt"), "one\n");
 
     // And it must not collide with the timeline of a differently-spelled pane.
-    let other = ops::snap(
-        &f.wt(),
-        &f.state,
-        "w31/pW",
-        BUDGET,
-        TurnKind::Turn,
-        SnapMeta::default(),
-        false,
-    )
-    .unwrap()
-    .unwrap();
+    let other =
+        ops::snap(&f.wt(), &f.state, "w31/pW", BUDGET, TurnKind::Turn, SnapMeta::default(), false)
+            .unwrap()
+            .unwrap();
     assert_eq!(other.seq, 1, "a different timeline must start its own numbering");
 }
 
@@ -760,9 +738,14 @@ fn a_kept_turn_still_restores_to_the_same_files_after_collection() {
     let before = ops::plan(&f.wt(), &f.state, "default", &keeper.to_string(), BUDGET).unwrap();
     let expected_tree = before.shadow.tree_of(&before.commit).unwrap();
 
-    let report =
-        ops::collect(&f.wt(), &f.state, "default", ops::Retention { keep: 3, max_age_days: None }, true)
-            .unwrap();
+    let report = ops::collect(
+        &f.wt(),
+        &f.state,
+        "default",
+        ops::Retention { keep: 3, max_age_days: None },
+        true,
+    )
+    .unwrap();
     assert_eq!(report.kept, 3);
     assert_eq!(report.dropped, 5, "8 turns kept at 3 should drop 5");
 
@@ -856,8 +839,14 @@ fn recording_continues_from_where_collection_left_off() {
     let seqs = record_turns(&f, "default", 6);
     let highest = *seqs.last().unwrap();
 
-    ops::collect(&f.wt(), &f.state, "default", ops::Retention { keep: 2, max_age_days: None }, true)
-        .unwrap();
+    ops::collect(
+        &f.wt(),
+        &f.state,
+        "default",
+        ops::Retention { keep: 2, max_age_days: None },
+        true,
+    )
+    .unwrap();
 
     f.write("a.txt", "after collection\n");
     let next =
@@ -880,7 +869,11 @@ fn the_last_turn_is_read_without_parsing_the_whole_log() {
     let store = sheep::store::Store::open(&f.state, &f.wt().id, "default").unwrap();
     let last = store.last().unwrap().expect("a recorded timeline has a last turn");
     assert_eq!(last.seq, *seqs.last().unwrap());
-    assert_eq!(last.seq, store.all().unwrap().last().unwrap().seq, "the fast path must agree with the slow one");
+    assert_eq!(
+        last.seq,
+        store.all().unwrap().last().unwrap().seq,
+        "the fast path must agree with the slow one"
+    );
     assert_eq!(store.next_seq().unwrap(), last.seq + 1);
 }
 
@@ -921,7 +914,11 @@ fn a_nested_repository_is_never_deleted_by_a_restore() {
 
     let planned =
         ops::plan(&f.wt(), &f.state, "default", &before_vendor.to_string(), BUDGET).unwrap();
-    assert_eq!(planned.plan.remove, vec!["vendor".to_string()], "the plan is one line, and that is the trap");
+    assert_eq!(
+        planned.plan.remove,
+        vec!["vendor".to_string()],
+        "the plan is one line, and that is the trap"
+    );
 
     let err = ops::restore(&f.wt(), &f.state, "default", &before_vendor.to_string(), BUDGET)
         .expect_err("removing a directory Sheep never captured must be refused");
@@ -929,9 +926,15 @@ fn a_nested_repository_is_never_deleted_by_a_restore() {
 
     // Everything survives, including the parts no snapshot could ever hold.
     assert!(vendor.join(".git").is_dir(), "the nested repository's history must survive");
-    assert_eq!(fs::read_to_string(vendor.join("uncommitted.txt")).unwrap(), "work nobody else has\n");
+    assert_eq!(
+        fs::read_to_string(vendor.join("uncommitted.txt")).unwrap(),
+        "work nobody else has\n"
+    );
     assert_eq!(fs::read_to_string(vendor.join(".env")).unwrap(), "SECRET=hunter2\n");
-    assert_eq!(fs::read_to_string(vendor.join("tracked.txt")).unwrap(), "committed inside vendor\n");
+    assert_eq!(
+        fs::read_to_string(vendor.join("tracked.txt")).unwrap(),
+        "committed inside vendor\n"
+    );
     assert_eq!(f.read("a.txt"), "one\n", "and the refusal happens before anything else is touched");
 }
 
@@ -992,11 +995,7 @@ fn a_restore_that_fails_partway_puts_the_tree_back() {
         let failed = err
             .downcast_ref::<ops::RestoreFailed>()
             .unwrap_or_else(|| panic!("a partial restore must be reported as one: {err:#}"));
-        assert!(
-            failed.recovered,
-            "the tree should have been put back; instead: {}",
-            err
-        );
+        assert!(failed.recovered, "the tree should have been put back; instead: {}", err);
         assert!(
             failed.checkpoint_seq.is_some(),
             "the way back has to be nameable even when recovery worked"

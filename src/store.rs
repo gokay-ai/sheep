@@ -99,7 +99,9 @@ impl Store {
         let body = match std::fs::read_to_string(&self.path) {
             Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(e) => return Err(e).with_context(|| format!("cannot read {}", self.path.display())),
+            Err(e) => {
+                return Err(e).with_context(|| format!("cannot read {}", self.path.display()))
+            }
         };
         Ok(body
             .lines()
@@ -121,7 +123,9 @@ impl Store {
         let mut file = match std::fs::File::open(&self.path) {
             Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(e).with_context(|| format!("cannot read {}", self.path.display())),
+            Err(e) => {
+                return Err(e).with_context(|| format!("cannot read {}", self.path.display()))
+            }
         };
         let len = file.metadata()?.len();
         if len == 0 {
@@ -138,7 +142,11 @@ impl Store {
 
             // Only trust a line we know is whole: unless we are at the start of
             // the file, the first line in the block may be a fragment.
-            let complete = if span == len { text.as_ref() } else { text.split_once('\n').map_or("", |(_, rest)| rest) };
+            let complete = if span == len {
+                text.as_ref()
+            } else {
+                text.split_once('\n').map_or("", |(_, rest)| rest)
+            };
             if let Some(turn) =
                 complete.lines().rev().filter_map(|l| serde_json::from_str::<Turn>(l).ok()).next()
             {

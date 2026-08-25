@@ -134,11 +134,7 @@ impl Git {
     pub fn run_z(&self, args: &[&str]) -> Result<Vec<String>> {
         let out = self.output(args)?;
         if !out.status.success() {
-            bail!(
-                "git {} failed: {}",
-                args.join(" "),
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
+            bail!("git {} failed: {}", args.join(" "), String::from_utf8_lossy(&out.stderr).trim());
         }
         Ok(String::from_utf8_lossy(&out.stdout)
             .split('\0')
@@ -180,7 +176,8 @@ impl Git {
             // Its exit status is the real answer, so this is not an error.
             Ok(Err(e)) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
             Ok(Err(e)) => {
-                return Err(e).with_context(|| format!("failed writing stdin to `git {}`", args.join(" ")))
+                return Err(e)
+                    .with_context(|| format!("failed writing stdin to `git {}`", args.join(" ")))
             }
             Ok(Ok(())) => {}
             Err(_) => bail!("the stdin writer thread for `git {}` panicked", args.join(" ")),
@@ -193,6 +190,5 @@ impl Git {
 /// hash to the same repository id or we would keep two shadow repos for one
 /// checkout.
 pub fn canonical(path: &Path) -> Result<PathBuf> {
-    std::fs::canonicalize(path)
-        .with_context(|| format!("cannot resolve path {}", path.display()))
+    std::fs::canonicalize(path).with_context(|| format!("cannot resolve path {}", path.display()))
 }
