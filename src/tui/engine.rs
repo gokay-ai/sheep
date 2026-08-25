@@ -268,6 +268,11 @@ fn patch(ctx: &Ctx, current_tree: &str, target_tree: &str, path: &str) -> anyhow
 
 /// `Ok(Err(plan))` means the working tree changed under the plan the user was
 /// looking at; they get the new one rather than a restore they did not confirm.
+///
+/// The check is [`ops::restore_expecting`]'s, not ours, and that matters: it
+/// compares and applies the *same* plan object with nothing in between. Doing it
+/// here would mean verifying one plan and then handing the operation a target to
+/// plan from scratch and apply — a third plan nobody looked at.
 #[allow(clippy::type_complexity)]
 fn restore(
     ctx: &Ctx,
@@ -276,12 +281,26 @@ fn restore(
     pane: Option<&str>,
     notify: bool,
 ) -> anyhow::Result<Result<Outcome, PlanView>> {
-    let fresh = plan(ctx, seq)?;
-    if fresh.current_tree != expect_tree {
-        return Ok(Err(fresh));
-    }
+    let target = format!("#{seq}");
+    let done = match ops::restore_expecting(
+        &ctx.wt,
+        &ctx.state,
+        &ctx.line,
+        &target,
+        ctx.max_files,
+        Some(expect_tree),
+    ) {
+        Ok(done) => done,
+        Err(e) => {
+            return match e.downcast_ref::<ops::StaleTree>() {
+                // Not an error to report: the working tree simply moved on. The
+                // plan it hands back is the truth now, so show that instead.
+                Some(stale) => Ok(Err(view(seq, commit_of(ctx, seq), &stale.plan))),
+                None => Err(e),
+            };
+        }
+    };
 
-    let done = ops::restore(&ctx.wt, &ctx.state, &ctx.line, &format!("#{seq}"), ctx.max_files)?;
     let checkpoint = done.checkpoint.as_ref().map(|t| t.seq);
     let written = done.plan.write.len();
     let removed = done.plan.remove.len();
@@ -299,6 +318,21 @@ fn restore(
     };
 
     Ok(Ok(Outcome { seq, commit: done.commit, written, removed, checkpoint, notice }))
+}
+
+/// The snapshot a turn points at, read back out of the turn log.
+///
+/// `StaleTree` carries the plan but not the commit it was planned against, and
+/// the headline of the refused plan names it. A miss leaves it empty rather than
+/// failing: an id is a caption, not a reason to abandon telling the user that
+/// nothing was written.
+fn commit_of(ctx: &Ctx, seq: u64) -> String {
+    Store::open(&ctx.state, &ctx.wt.id, &ctx.line)
+        .and_then(|store| store.find(seq))
+        .ok()
+        .flatten()
+        .map(|turn| turn.commit)
+        .unwrap_or_default()
 }
 
 /// What the agent is told after its worktree moved underneath it.

@@ -198,15 +198,24 @@ fn print_snapshot(app: &App, spec: &str) -> Result<()> {
 
 // --------------------------------------------------------------- interactive
 
+/// How long a quit will wait for an in-flight restore to finish before giving
+/// up on it. A restore is a second of `git`; a minute means something is wrong,
+/// and trapping someone in a window forever is not the answer to that.
+const FINISH_GRACE: Duration = Duration::from_secs(60);
+
 fn interact(mut app: App, ctx: Option<Ctx>) -> Result<()> {
     let mut terminal = enter()?;
     let worker = ctx.map(|ctx| Worker::spawn(ctx, POLL));
+    let mut waiting_since: Option<std::time::Instant> = None;
 
     let result = (|| -> Result<()> {
         loop {
             terminal.draw(|frame| render::draw(frame, &app))?;
 
-            if event::poll(FRAME)? {
+            // Once the user has asked to quit, stop reading keys entirely: the
+            // only thing left to do is let the worker finish the write it is in
+            // the middle of.
+            if !app.quit && event::poll(FRAME)? {
                 match event::read()? {
                     Event::Key(key) if key.kind != KeyEventKind::Release => {
                         if let Some(key) = translate(key) {
@@ -215,7 +224,11 @@ fn interact(mut app: App, ctx: Option<Ctx>) -> Result<()> {
                     }
                     _ => {}
                 }
+            } else if app.quit {
+                std::thread::sleep(FRAME);
             }
+
+            let was_restoring = app.restoring;
             if let Some(worker) = &worker {
                 while let Ok(reply) = worker.replies.try_recv() {
                     app.apply(reply);
@@ -226,15 +239,45 @@ fn interact(mut app: App, ctx: Option<Ctx>) -> Result<()> {
             } else {
                 app.take_jobs();
             }
+            // A restore just ended. Whatever was typed while it ran is sitting
+            // in the terminal's buffer, aimed at a screen that no longer exists
+            // — a `Reply::Stale` puts a different plan up, and a queued `R`
+            // would confirm it. Throw the backlog away.
+            if was_restoring && !app.restoring {
+                drain_input()?;
+            }
+
             app.tick(shadow::now());
+
             if app.quit {
-                return Ok(());
+                if !app.restoring {
+                    return Ok(());
+                }
+                // Never exit on top of a half-applied restore: the process
+                // dying between the deletions and the writes leaves a tree that
+                // is neither state. Wait for the worker to come back.
+                let since = waiting_since.get_or_insert_with(std::time::Instant::now);
+                if since.elapsed() > FINISH_GRACE {
+                    anyhow::bail!(
+                        "quit while a restore was still running after {}s; the worktree may be \
+                         half-restored. Run `sheep log` and `sheep diff` before trusting it.",
+                        FINISH_GRACE.as_secs()
+                    );
+                }
             }
         }
     })();
 
     leave(&mut terminal)?;
     result
+}
+
+/// Discard every input event already buffered, without blocking.
+fn drain_input() -> Result<()> {
+    while event::poll(Duration::ZERO)? {
+        let _ = event::read()?;
+    }
+    Ok(())
 }
 
 fn translate(ev: KeyEvent) -> Option<Key> {

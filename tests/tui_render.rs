@@ -350,6 +350,77 @@ fn the_help_overlay_documents_the_restore_key() {
 }
 
 #[test]
+fn a_short_commit_id_does_not_take_the_interface_down() {
+    // `ops::short` bounds its own slice; a second unbounded one on top of it
+    // turns a truncated turn log into a panic on every frame wide enough to
+    // show the column.
+    let mut stub = turn(2, TurnKind::Turn, 3);
+    stub.commit = "abc".into();
+    let mut empty = turn(1, TurnKind::Turn, 9);
+    empty.commit = String::new();
+    let app = app_with(vec![stub, empty]);
+
+    for width in [40u16, 62, 63, 92, 160] {
+        let screen = frame(&app, width, 18);
+        shows(&screen, "#2");
+        shows(&screen, "#1");
+    }
+    // Wide enough for the id column: the short id is shown as far as it goes.
+    shows(&frame(&app, 92, 18), "abc · 3m ago");
+}
+
+#[test]
+fn the_border_does_not_promise_a_dry_run_while_it_is_writing() {
+    let mut app = demo();
+    app.on_key(Key::Down);
+    open_rewind(&mut app, plan_view());
+    let before = frame(&app, 88, 24);
+    shows(&before, "dry run — nothing is written yet");
+
+    app.restoring = true;
+    let during = frame(&app, 88, 24);
+    shows(&during, "checkpointing the tree you have, then restoring");
+    shows(&during, "writing — do not interrupt");
+    hides(&during, "dry run — nothing is written yet");
+    // and the key that starts a write is no longer offered
+    hides(&during, "shift+R");
+}
+
+#[test]
+fn quitting_during_a_restore_says_why_the_window_is_still_open() {
+    let mut app = demo();
+    app.on_key(Key::Down);
+    open_rewind(&mut app, plan_view());
+    app.restoring = true;
+    shows(&frame(&app, 88, 24), "keys are ignored until it finishes");
+
+    app.on_key(Key::Char('q'));
+    assert!(app.quit && app.restoring, "quitting must not clear the in-flight restore");
+    let screen = frame(&app, 88, 24);
+    shows(&screen, "finishing this before quitting");
+    shows(&screen, "killing the window now would");
+    shows(&screen, "neither state.");
+}
+
+#[test]
+fn outside_herdr_the_footer_does_not_promise_a_write_back() {
+    // A timeline can carry a pane id from an earlier herdr session while this
+    // process has no socket to reach it through.
+    let mut app = demo();
+    app.inside_herdr = false;
+    app.on_key(Key::Down);
+    open_rewind(&mut app, plan_view());
+    let screen = frame(&app, 88, 26);
+    assert!(
+        app.agent_pane().is_some(),
+        "the fixture has to carry a pane id for this to mean anything"
+    );
+    hides(&screen, "will be told what was taken back");
+    shows(&screen, "not running inside herdr — there is no agent to tell.");
+    shows(&screen, "standalone");
+}
+
+#[test]
 fn nothing_ever_draws_past_the_edge_of_the_terminal() {
     let mut plan = plan_view();
     plan.files

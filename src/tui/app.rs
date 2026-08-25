@@ -209,6 +209,23 @@ impl App {
             }
             return;
         }
+        // A restore takes about a second, and a terminal buffers every key
+        // pressed during it. Someone leaning on `R` must not have those presses
+        // land on whatever state the restore leaves behind — a `Reply::Stale`
+        // puts a *different* plan on screen, and a queued `R` would confirm a
+        // plan nobody read. Quitting is still allowed: the runtime waits for the
+        // worker to finish the write rather than exiting on top of it.
+        if self.restoring {
+            match key {
+                Key::Char('q') | Key::Char('Q') => self.quit = true,
+                _ => {
+                    self.status = Some(Status::info(
+                        "a restore is running — keys are ignored until it finishes",
+                    ))
+                }
+            }
+            return;
+        }
         match self.mode {
             Mode::Help => match key {
                 Key::Char('q') => self.quit = true,

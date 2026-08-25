@@ -396,7 +396,13 @@ fn a_working_tree_that_moved_under_the_plan_is_refused() {
         },
     );
     match reply {
-        Reply::Stale { plan, .. } => assert_eq!(plan.seq, 1),
+        Reply::Stale { plan, .. } => {
+            assert_eq!(plan.seq, 1);
+            // The plan handed back describes the tree as it is *now*, so the
+            // user is reading the truth rather than the plan they had.
+            assert_ne!(plan.current_tree, "a-tree-that-is-no-longer-what-is-on-disk");
+            assert!(!plan.commit.is_empty(), "the refused plan should still name its target");
+        }
         other => panic!("expected a refusal, got {other:?}"),
     }
     assert_eq!(
@@ -408,6 +414,59 @@ fn a_working_tree_that_moved_under_the_plan_is_refused() {
         fixture.turns().iter().all(|t| t.kind != TurnKind::Checkpoint),
         "a refused restore should not even checkpoint"
     );
+}
+
+/// The realistic shape of the race: a plan is read, the agent writes, then the
+/// key is pressed. Nothing may be applied, and the new plan takes the screen.
+#[test]
+fn a_tree_that_moves_between_reading_the_plan_and_pressing_the_key_is_refused() {
+    let fixture = Fixture::new();
+    fixture.write("a.txt", "one\n");
+    fixture.write("b.txt", "b\n");
+    git(&fixture.repo, &["add", "-A"]);
+    git(&fixture.repo, &["commit", "--quiet", "-m", "init"]);
+    fixture.snap("claude", "first");
+    fixture.write("a.txt", "two\n");
+    fixture.snap("claude", "second");
+
+    let ctx = fixture.ctx();
+    let mut app = App::new("repo", fixture.repo.display().to_string(), "default");
+    app.reload();
+    pump(&ctx, &mut app);
+    app.on_key(Key::Down); // turn #1
+    app.on_key(Key::Enter);
+    pump(&ctx, &mut app);
+    let PlanState::Ready(seen) = &app.plan else { panic!("no plan") };
+    assert_eq!(seen.touched(), 1, "the plan on screen touches one file");
+
+    // The agent writes a second file while the plan is being read.
+    fixture.write("b.txt", "b changed by the agent\n");
+
+    app.on_key(Key::Char('R'));
+    pump(&ctx, &mut app);
+
+    assert!(!app.restoring);
+    assert_eq!(
+        fs::read_to_string(fixture.repo.join("a.txt")).unwrap(),
+        "two\n",
+        "nothing may be written when the tree moved"
+    );
+    assert_eq!(fs::read_to_string(fixture.repo.join("b.txt")).unwrap(), "b changed by the agent\n");
+    assert!(
+        fixture.turns().iter().all(|t| t.kind != TurnKind::Checkpoint),
+        "a refused restore should not even checkpoint"
+    );
+    let status = app.status.as_ref().expect("the refusal has to be reported");
+    assert_eq!(status.level, Level::Bad);
+    assert!(status.lines.iter().any(|l| l.contains("nothing was restored")), "{status:?}");
+    match &app.plan {
+        PlanState::Ready(plan) => assert_eq!(
+            plan.touched(),
+            2,
+            "the plan on screen is now the one that reflects what the agent did"
+        ),
+        other => panic!("expected the new plan, got {other:?}"),
+    }
 }
 
 #[test]
@@ -444,6 +503,69 @@ fn the_patch_preview_reads_the_hunks_out_of_the_shadow_repo() {
         }
         other => panic!("expected a patch, got {other:?}"),
     }
+}
+
+#[test]
+fn keys_pressed_during_a_restore_cannot_reach_a_second_write() {
+    let mut app = app_with_plan();
+    app.on_key(Key::Char('R'));
+    let first: Vec<_> =
+        app.take_jobs().into_iter().filter(|j| matches!(j, Job::Restore { .. })).collect();
+    assert_eq!(first.len(), 1);
+    assert!(app.restoring);
+
+    // Someone leaning on the key for the second the restore takes.
+    for key in [Key::Char('R'), Key::Char('R'), Key::Enter, Key::Char('j'), Key::Char('d')] {
+        app.on_key(key);
+    }
+    assert!(app.take_jobs().is_empty(), "no keystroke may queue work while a restore is in flight");
+    assert!(app.status.as_ref().unwrap().lines[0].contains("keys are ignored"));
+
+    // The tree had moved, so a *different* plan lands on screen. The presses
+    // from a moment ago must not have survived to confirm it.
+    let Job::Restore { req, .. } = first[0] else { unreachable!() };
+    let mut fresher = plan_view();
+    fresher.files.push((Action::Remove, "src/gone.ts".into()));
+    fresher.removed = 1;
+    app.apply(Reply::Stale { req, plan: fresher });
+    assert!(!app.restoring);
+    assert!(
+        !app.take_jobs().iter().any(|j| matches!(j, Job::Restore { .. })),
+        "a queued press must not carry over onto the new plan"
+    );
+
+    // And the legitimate path still works: a deliberate press on the plan that
+    // is now on screen does start a restore.
+    app.on_key(Key::Char('R'));
+    assert_eq!(app.take_jobs().iter().filter(|j| matches!(j, Job::Restore { .. })).count(), 1);
+}
+
+#[test]
+fn quitting_during_a_restore_leaves_the_write_in_flight_for_the_runtime_to_finish() {
+    let mut app = app_with_plan();
+    app.on_key(Key::Char('R'));
+    app.take_jobs();
+    assert!(app.restoring);
+
+    app.on_key(Key::Char('q'));
+    assert!(app.quit, "quitting must still be possible");
+    assert!(app.restoring, "quitting must not clear the flag the runtime waits on before exiting");
+
+    // Only when the worker answers does the interface become quittable.
+    let mut done = plan_view();
+    done.files.clear();
+    app.apply(Reply::Restored {
+        req: 2,
+        outcome: sheep::tui::engine::Outcome {
+            seq: 1,
+            commit: "c0ffee".repeat(6),
+            written: 1,
+            removed: 0,
+            checkpoint: Some(2),
+            notice: Notice::Off,
+        },
+    });
+    assert!(!app.restoring);
 }
 
 #[test]

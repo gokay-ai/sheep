@@ -174,7 +174,7 @@ fn header(app: &App, width: usize) -> Vec<Line<'static>> {
             text::age(app.now, t.at)
         }
     });
-    let mut facts = vec![format!("timeline {}", app.line), format!("{} turns", app.turns.len())];
+    let mut facts = vec![format!("timeline {}", app.line), plural(app.turns.len(), "turn")];
     if let Some(age) = newest {
         facts.push(format!("newest {age}"));
     }
@@ -291,11 +291,8 @@ fn turn_rows(
     // --- identity. On a wide dock the snapshot id fills the gap the age
     // leaves; on a narrow one it is the first thing dropped.
     let age = if compact { text::age_short(app.now, turn.at) } else { text::age(app.now, turn.at) };
-    let tail = if avail >= 62 {
-        format!("{} · {age}", &crate::ops::short(&turn.commit)[..8])
-    } else {
-        age
-    };
+    let tail =
+        if avail >= 62 { format!("{} · {age}", text::abbrev(&turn.commit, 8)) } else { age };
     let kind_width = if compact { 5 } else { 11 };
     let agent_budget =
         avail.saturating_sub((if compact { 4 } else { 5 }) + kind_width + text::width(&tail) + 1);
@@ -395,10 +392,15 @@ fn turn_rows(
 }
 
 fn files(n: usize) -> String {
+    plural(n, "file")
+}
+
+/// `1 turn`, `4 turns`. A dock that says "1 turns" reads as unfinished.
+fn plural(n: usize, noun: &str) -> String {
     if n == 1 {
-        "1 file".into()
+        format!("1 {noun}")
     } else {
-        format!("{n} files")
+        format!("{n} {noun}s")
     }
 }
 
@@ -468,8 +470,14 @@ fn draw_rewind(frame: &mut Frame, area: Rect, app: &App) {
         .border_style(theme::accent())
         .title(Span::styled(title, theme::accent_strong()))
         .title_bottom(
-            Line::from(Span::styled(" dry run — nothing is written yet ", theme::dim()))
-                .right_aligned(),
+            Line::from(if app.restoring {
+                // The frame that says "restoring…" in its body must not say
+                // "nothing is written yet" on its border.
+                Span::styled(" writing — do not interrupt ", theme::danger())
+            } else {
+                Span::styled(" dry run — nothing is written yet ", theme::dim())
+            })
+            .right_aligned(),
         );
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
@@ -731,7 +739,17 @@ fn footer(app: &App, width: usize) -> Vec<Line<'static>> {
             theme::accent_strong(),
             &mut lines,
         );
-        lines.push(Line::raw(""));
+        if app.quit {
+            say(
+                "finishing this before quitting — killing the window now would leave a tree \
+                 that is neither state."
+                    .to_string(),
+                theme::danger(),
+                &mut lines,
+            );
+        } else {
+            say("keys are ignored until it finishes.".to_string(), theme::dim(), &mut lines);
+        }
         return lines;
     }
 
@@ -753,17 +771,25 @@ fn footer(app: &App, width: usize) -> Vec<Line<'static>> {
                 theme::dim(),
                 &mut lines,
             );
+            // The last sentence before a write has to be true. A timeline can
+            // carry a pane id from an earlier herdr session while this process
+            // has no socket to reach it through, so the promise is only made
+            // when all three of notify, a live session and a pane are there.
             let pane = app.agent_pane();
-            let (notice, style) = match (app.notify, &pane) {
-                (false, _) => (
+            let (notice, style) = match (app.notify, app.inside_herdr, &pane) {
+                (false, _, _) => (
                     "the agent will NOT be told what changed (n turns this back on).".to_string(),
                     theme::warn(),
                 ),
-                (true, Some(pane)) => (
+                (true, false, _) => (
+                    "not running inside herdr — there is no agent to tell.".to_string(),
+                    theme::warn(),
+                ),
+                (true, true, Some(pane)) => (
                     format!("the agent in pane {pane} will be told what was taken back."),
                     theme::accent(),
                 ),
-                (true, None) => (
+                (true, true, None) => (
                     "no agent pane recorded on this timeline — nobody will be told.".to_string(),
                     theme::warn(),
                 ),

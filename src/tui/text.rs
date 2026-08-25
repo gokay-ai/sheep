@@ -30,6 +30,17 @@ pub fn truncate(s: &str, max: usize) -> String {
     out
 }
 
+/// The first `n` characters of an object id.
+///
+/// By characters, not bytes: `ops::short` already bounds its own slice, and a
+/// second unbounded `[..n]` on top of it hands the whole interface a panic the
+/// moment a turn carries a commit shorter than `n` — which a hand-edited or
+/// truncated turn log can produce, and which a dock would then hit on every
+/// frame wide enough to show the column.
+pub fn abbrev(oid: &str, n: usize) -> String {
+    oid.chars().take(n).collect()
+}
+
 /// Collapse a screen-scraped string into one printable line.
 ///
 /// Prompts are read off a terminal pane, so they arrive with newlines, tabs and
