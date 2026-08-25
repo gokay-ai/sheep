@@ -10,5 +10,7 @@
 //! working directory does that pane sit in".
 
 pub mod cli;
+pub mod wire;
 
 pub use cli::WatchArgs;
+pub use wire::{inside_herdr, request, try_request, ApiError, Event, Subscription};
