@@ -1028,8 +1028,8 @@ fn a_cd_while_the_agent_is_still_working_files_nothing_anywhere() {
     let recorder = run(&herdr, &ground.state, false, steps);
 
     assert!(
-        ground.turns(&wandered_to, "claude").is_empty(),
-        "nothing at all may be filed against a repository the agent never touched"
+        ground.recorded(&wandered_to, "claude").is_empty(),
+        "no turn may be filed against a repository the agent never touched"
     );
     assert!(
         ground.recorded(&worked_in, "claude").is_empty(),
@@ -1145,4 +1145,33 @@ fn a_pane_still_painting_is_watched_even_while_herdr_forgets_its_agent() {
         1,
         "and the turn still lands once the pane finally goes quiet"
     );
+}
+
+#[test]
+fn a_turn_is_measured_against_the_tree_from_before_the_agent_started_writing() {
+    // Herdr infers `working` from what a pane paints, so the edge arrives after
+    // the agent has already begun. A baseline taken on that edge contains the
+    // turn's own first edit, the boundary then compares equal, and a real turn
+    // is silently not recorded. A live session lost exactly this on the first
+    // run: the file on disk had changed and the timeline held only a baseline.
+    let ground = Ground::new();
+    let repo = ground.repo("work");
+    let herdr = Herdr::default();
+    herdr
+        .pane("w1:p1", "claude", &repo, Status::Idle)
+        .processes("w1:p1", vec![agent_running(&[4_200])])
+        .screen("w1:p1", "❯ write something\n");
+
+    let steps = vec![
+        // The agent writes before herdr calls the pane `working`.
+        edit(repo.join("src.rs"), "fn main() { /* written first */ }\n"),
+        status("w1:p1", "claude", &repo, "working", 10),
+        status("w1:p1", "claude", &repo, "idle", 11),
+        Step::Rest(SETTLE_MS * 2),
+    ];
+    run(&herdr, &ground.state, false, steps);
+
+    let turns = ground.recorded(&repo, "claude");
+    assert_eq!(turns.len(), 1, "the edit happened and has to be recorded: {turns:?}");
+    assert_eq!(turns[0].insertions, 1, "measured against the tree from before the turn");
 }

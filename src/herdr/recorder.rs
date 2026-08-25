@@ -346,6 +346,21 @@ impl<S: Session> Recorder<S> {
         if sighting.agent.is_none() && !self.detector.is_tracked(&sighting.pane_id) {
             return;
         }
+        // The first time we lay eyes on an agent pane is the earliest — and so
+        // the truest — baseline available, and it is worth taking even though
+        // the pane may sit idle for hours afterwards.
+        //
+        // Taking it at the *start* of a turn instead loses a race that a live
+        // session lost on the first try: herdr infers `working` from what the
+        // pane paints, so by the time the edge arrives a fast agent has already
+        // written its first file. The baseline then contains the turn's own
+        // work, the boundary compares equal, and a real turn is silently not
+        // recorded. `baseline` is keyed by timeline and does nothing twice, so
+        // the call on the turn edge stays for the timeline that is new rather
+        // than the pane.
+        if !self.detector.is_tracked(&sighting.pane_id) {
+            self.baseline(&sighting.pane_id, sighting.agent.as_deref(), sighting.cwd.as_deref());
+        }
         for signal in self.detector.observe(now, sighting) {
             self.act(signal);
         }
