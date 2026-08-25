@@ -52,10 +52,11 @@ Sheep does not restore a conversation. It restores files, and then tells the con
 
 `sheep watch` holds one subscription to herdr and follows every agent pane in the session. When a pane leaves `working` for `idle`/`done` it opens a *candidate* boundary — and then refuses to believe it for ten seconds, because herdr infers status from what a pane paints and calls agents `done` mid-turn. The default settle window is measured rather than guessed: a live herdr 0.8.0 session was watched flipping a pane to `done` and back to `working` **9.2 seconds later**, with the agent still working.
 
-It says what it did in a log file rather than in the pane you are using. From a real run against
-a session with eight agent panes (home paths shortened):
+It says what it did in a log file rather than in the pane you are using. From a real run against a
+session with eight agent panes, started with `--line-by pane` so each timeline is named after the
+pane that produced it (home paths shortened):
 
-```text
+```console
 $ tail -f ~/.local/state/herdr/plugins/sheep/logs/watch.log
 2026-08-25 18:54:43Z info w3K:p1: baseline #1 on w3K:p1 — 57 file(s) in ~/…/herdr-max
 2026-08-25 18:56:45Z info w3S:p1: herdr no longer lists an agent here; forgetting it
@@ -65,9 +66,9 @@ $ tail -f ~/.local/state/herdr/plugins/sheep/logs/watch.log
 ```
 
 An agent that answered a question without editing anything does not get a row. Neither does a
-candidate that goes back to `working`, or to `blocked`, or whose pane changes directory while the
-turn is in flight, or whose foreground process group is still starting things — each of those
-withdraws the boundary and says which one it was.
+candidate that goes back to `working`, or to `blocked`, or whose pane changed directory while the
+turn was in flight: each of those withdraws the boundary and the log says which one it was. A pane
+whose process group is still starting things does not lose its turn — it just waits longer.
 
 ### Shows you the plan before it writes anything
 
