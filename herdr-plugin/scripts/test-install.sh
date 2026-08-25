@@ -76,13 +76,15 @@ Linux|x86_64|musl|sheep-x86_64-unknown-linux-musl
 Linux|amd64|musl|sheep-x86_64-unknown-linux-musl
 Linux|aarch64|gnu|sheep-aarch64-unknown-linux-gnu
 Linux|arm64|gnu|sheep-aarch64-unknown-linux-gnu
-MINGW64_NT-10.0|x86_64||sheep-x86_64-pc-windows-msvc.exe
-MSYS_NT-10.0|x86_64||sheep-x86_64-pc-windows-msvc.exe
 CASES
 
-# Platforms with no prebuilt asset must say so rather than guess. aarch64 musl
-# is the interesting one: an aarch64 machine that is not glibc must NOT be
-# handed the gnu binary, because it cannot start it.
+# Platforms with no prebuilt asset must say so rather than guess. Two are worth
+# naming: aarch64 musl, where an aarch64 machine that is not glibc must NOT be
+# handed the gnu binary because it cannot start it; and Git Bash / MSYS2, which
+# used to resolve a windows-msvc asset. Sheep does not build one — the recorder
+# is herdr's unix-socket API and there is no transport for it on Windows — so
+# these must fall through to "none" rather than install a binary that starts and
+# then records nothing.
 echo "== platforms with no asset =="
 while IFS='|' read -r os arch libc; do
   case "$os" in '' | '#'*) continue ;; esac
@@ -94,6 +96,9 @@ Linux|armv7l|gnu
 Linux|riscv64|gnu
 Darwin|ppc
 FreeBSD|amd64
+MINGW64_NT-10.0|x86_64
+MSYS_NT-10.0|x86_64
+CYGWIN_NT-10.0|x86_64
 UNSUPPORTED
 
 # --- 2. the round trip with release.yml --------------------------------------
@@ -103,7 +108,7 @@ echo "== release matrix round trip =="
 # still what /bin/bash is on macOS, mis-parses a case pattern's `)` in there.
 workflow_assets=$(
   sed -n 's/^ *- target: *\([A-Za-z0-9_.-]*\).*/\1/p' "$workflow" |
-    sed -e 's/^/sheep-/' -e 's/^\(sheep-.*windows.*\)$/\1.exe/' |
+    sed -e 's/^/sheep-/' |
     sort -u
 )
 [ -n "$workflow_assets" ] || {
@@ -118,7 +123,6 @@ detected_assets=$(
     resolve_asset Linux x86_64 gnu
     resolve_asset Linux x86_64 musl
     resolve_asset Linux aarch64 gnu
-    resolve_asset MINGW64_NT-10.0 x86_64 ""
   } | sort -u
 )
 

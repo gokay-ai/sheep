@@ -18,19 +18,3 @@ key = "prefix+Z"
 type = "plugin_action"
 command = "sheep.dock"
 description = "show the Sheep timeline"
-
-# On Windows the action ids carry a `-windows` suffix — herdr rejects duplicate
-# action ids even when the two entries are gated to different platforms — so use
-# these two lines there instead of the pair above.
-#
-# [[keys.command]]
-# key = "prefix+z"
-# type = "plugin_action"
-# command = "sheep.rewind-windows"
-# description = "rewind this agent"
-#
-# [[keys.command]]
-# key = "prefix+Z"
-# type = "plugin_action"
-# command = "sheep.dock-windows"
-# description = "show the Sheep timeline"

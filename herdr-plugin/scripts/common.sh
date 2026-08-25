@@ -59,21 +59,28 @@ sheep_target_cwd() {
   printf '%s\n' "$cwd"
 }
 
-# The timeline to record against: one per agent pane, `default` when there is no
-# pane to name it after. HERDR_PANE_ID is set for action and event commands
-# whenever a pane is focused.
+# The timeline this action or pane is about.
 #
-# The pane id goes through verbatim on purpose, even though `sheep snap` cannot
-# take it yet: herdr pane ids look like `w31:pW`, and `shadow::ref_name` builds
-# `refs/sheep/<line>` from the raw string, which git rejects for the colon
-# ("refusing to update ref with bad name"). `store::sanitize` already maps
-# non-alphanumerics to `-` for the turn log's filename; the shadow ref needs the
-# same treatment. Sanitizing here instead would only move the bug — the recorder
-# passes the same ids and would then disagree with this script about which
-# timeline a pane owns.
+# `sheep watch` is the only thing that records agent turns, and it names a
+# timeline after the agent herdr attributes to the pane — `claude`, `codex` —
+# because that is `--line-by`'s default and nothing here overrides it. Every
+# pane and action below has to arrive at the SAME string or the dock reads a
+# timeline nothing writes, and "nothing recorded yet" becomes indistinguishable
+# from "you are looking in the wrong place". So this asks herdr the same
+# question the recorder asks: `focused_pane_agent`, straight out of the
+# invocation context.
+#
+# Not the pane id. `w31:pW` is reassigned on every herdr restart, so a per-pane
+# timeline would start empty again after each one — and the recorder does not
+# use it. That is also why the fallback is `default` rather than the pane id:
+# `default` is the name a standalone `sheep snap` uses, so a pane herdr
+# attributes no agent to lands on a timeline that exists in the model instead of
+# on one nothing else will ever name.
+#
+# `tests/plugin_timeline.rs` sources this file and asserts the string it prints
+# is the string `WatchArgs`' default produces for the same pane.
 sheep_target_line() {
-  line=${HERDR_PANE_ID:-}
-  [ -n "$line" ] || line=$(sheep_context_field focused_pane_id)
+  line=$(sheep_context_field focused_pane_agent)
   [ -n "$line" ] || line=default
   printf '%s\n' "$line"
 }
