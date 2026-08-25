@@ -400,13 +400,46 @@ impl Shadow {
         }
 
         let root = &self.worktree.root;
+
+        // A removal is always a single file: `diff-tree -r` reports leaves, and
+        // an emptied directory is pruned afterwards. A removal that is a
+        // directory on disk therefore means one of two things, and neither may
+        // be deleted.
+        //
+        // The dangerous one is a nested git repository. `git add -A` records
+        // any repository inside the worktree as one gitlink entry — a commit
+        // pointer, nothing else — so restoring past the point it appeared
+        // produces a one-line plan whose contents no snapshot holds. Deleting
+        // it would take that repository's own history, its uncommitted work and
+        // its ignored files with it, and the checkpoint taken beforehand could
+        // not bring any of it back. That is invariants 4, 5 and 8 at once.
+        //
+        // The other is a path that turned into a directory between the plan and
+        // the write, which is the stale-tree case wearing a different hat.
+        let directories: Vec<&String> = plan
+            .remove
+            .iter()
+            .filter(|rel| std::fs::symlink_metadata(root.join(rel)).is_ok_and(|m| m.is_dir()))
+            .collect();
+        if let Some(first) = directories.first() {
+            bail!(
+                "refusing to restore: `{first}` is a directory whose contents Sheep never captured{}.\nA git repository inside your worktree is recorded only as a pointer, so removing it here would delete files no snapshot holds — including anything ignored inside it. Move or delete it yourself if that is what you want.",
+                if directories.len() > 1 {
+                    format!(" (and {} more)", directories.len() - 1)
+                } else {
+                    String::new()
+                }
+            );
+        }
+
         for rel in &plan.remove {
             let path = root.join(rel);
-            match std::fs::symlink_metadata(&path) {
-                Ok(meta) if meta.is_dir() => std::fs::remove_dir_all(&path)?,
-                Ok(_) => std::fs::remove_file(&path)
-                    .with_context(|| format!("cannot remove {}", path.display()))?,
-                Err(_) => {}
+            // A path already gone is not a problem: the goal is that it is not
+            // there afterwards, not that we were the one to remove it.
+            if let Err(e) = std::fs::remove_file(&path) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    return Err(e).with_context(|| format!("cannot remove {}", path.display()));
+                }
             }
         }
         prune_empty_dirs(root, &plan.remove)?;
@@ -455,6 +488,18 @@ impl Shadow {
                     parts.next().unwrap_or_default().to_string(),
                 ))
             })
+            .collect())
+    }
+
+    /// Paths a tree records as gitlinks — repositories nested inside the
+    /// worktree, stored as a commit pointer and nothing more.
+    pub fn gitlinks(&self, tree: &str) -> Result<Vec<String>> {
+        Ok(self
+            .git()
+            .run_z(&["ls-tree", "-r", "-z", "-t", tree])?
+            .into_iter()
+            .filter(|entry| entry.starts_with("160000"))
+            .filter_map(|entry| entry.split_once('\t').map(|(_, path)| path.to_string()))
             .collect())
     }
 

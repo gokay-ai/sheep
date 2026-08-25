@@ -883,3 +883,77 @@ fn the_last_turn_is_read_without_parsing_the_whole_log() {
     assert_eq!(last.seq, store.all().unwrap().last().unwrap().seq, "the fast path must agree with the slow one");
     assert_eq!(store.next_seq().unwrap(), last.seq + 1);
 }
+
+#[test]
+fn a_nested_repository_is_never_deleted_by_a_restore() {
+    // Found by a security audit, and the worst bug in the project's history.
+    //
+    // `git add -A` records a repository inside the worktree as one gitlink — a
+    // commit pointer, nothing else. So restoring to a turn taken before that
+    // repository existed produced a one-line plan, `remove vendor`, which the
+    // apply step resolved to a directory and deleted whole. Nothing inside it
+    // was in any snapshot, so the checkpoint taken beforehand restored an empty
+    // directory and the work was gone for good: the repository's own history,
+    // its uncommitted files, and its ignored files.
+    let f = Fixture::new();
+    f.write("a.txt", "one\n");
+    f.commit_all("base");
+    let before_vendor = f.snap("before the nested repository existed");
+
+    let vendor = f.repo.join("vendor");
+    fs::create_dir_all(&vendor).unwrap();
+    git(&vendor, &["init", "--quiet", "-b", "main"]);
+    fs::write(vendor.join("uncommitted.txt"), "work nobody else has\n").unwrap();
+    fs::write(vendor.join(".env"), "SECRET=hunter2\n").unwrap();
+    fs::write(vendor.join(".gitignore"), ".env\n").unwrap();
+    fs::write(vendor.join("tracked.txt"), "committed inside vendor\n").unwrap();
+    git(&vendor, &["add", "-A"]);
+    git(&vendor, &["commit", "--quiet", "-m", "vendor base"]);
+    f.snap("the nested repository exists now");
+
+    // It must be visible before anything happens, not discovered afterwards.
+    let health = repo::inspect(&f.wt(), BUDGET).unwrap();
+    assert!(
+        health.warnings.iter().any(|w| matches!(w, Warning::NestedRepositories(paths) if paths.iter().any(|p| p == "vendor"))),
+        "a nested repository must be surfaced by doctor: {:?}",
+        health.warnings
+    );
+
+    let planned =
+        ops::plan(&f.wt(), &f.state, "default", &before_vendor.to_string(), BUDGET).unwrap();
+    assert_eq!(planned.plan.remove, vec!["vendor".to_string()], "the plan is one line, and that is the trap");
+
+    let err = ops::restore(&f.wt(), &f.state, "default", &before_vendor.to_string(), BUDGET)
+        .expect_err("removing a directory Sheep never captured must be refused");
+    assert!(err.to_string().contains("vendor"), "the refusal should name it: {err}");
+
+    // Everything survives, including the parts no snapshot could ever hold.
+    assert!(vendor.join(".git").is_dir(), "the nested repository's history must survive");
+    assert_eq!(fs::read_to_string(vendor.join("uncommitted.txt")).unwrap(), "work nobody else has\n");
+    assert_eq!(fs::read_to_string(vendor.join(".env")).unwrap(), "SECRET=hunter2\n");
+    assert_eq!(fs::read_to_string(vendor.join("tracked.txt")).unwrap(), "committed inside vendor\n");
+    assert_eq!(f.read("a.txt"), "one\n", "and the refusal happens before anything else is touched");
+}
+
+#[test]
+fn a_path_that_became_a_directory_under_the_plan_is_refused() {
+    // The same guard from the other direction: between planning and applying,
+    // a file the plan means to remove turns into a directory. Deleting it would
+    // take contents the plan never described.
+    let f = Fixture::new();
+    f.write("a.txt", "one\n");
+    f.commit_all("base");
+    let target = f.snap("turn 1");
+    f.write("later.txt", "added by the agent\n");
+    f.snap("turn 2");
+
+    let planned = ops::plan(&f.wt(), &f.state, "default", &target.to_string(), BUDGET).unwrap();
+    assert_eq!(planned.plan.remove, vec!["later.txt".to_string()]);
+
+    fs::remove_file(f.repo.join("later.txt")).unwrap();
+    f.write("later.txt/surprise.txt", "written after the plan was made\n");
+
+    let err = planned.shadow.apply(&planned.plan).expect_err("a directory must not be removed");
+    assert!(err.to_string().contains("later.txt"), "the refusal should name it: {err}");
+    assert!(f.exists("later.txt/surprise.txt"), "its contents must survive");
+}
