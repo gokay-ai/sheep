@@ -116,6 +116,18 @@ things, so the window was extended by ten seconds and the turn recorded after th
 pane that changed directory mid-turn, because the tree that would be snapshotted is no longer the
 tree the agent worked in.
 
+That run left this behind, which is a whole timeline recorded without anybody asking for one:
+
+```console
+$ sheep log --line w3K:p0
+#2    8d615da1a2eb  turn         11 files  +1100   -97
+#1    c5e3e6f87356  checkpoint   60 files  +0      -0      baseline, before the first recorded turn
+```
+
+The note on `#2` is empty on purpose. No API tells a plugin what a user typed, so the prompt beside a
+turn is read off the pane — and when it has scrolled away Sheep leaves the column blank rather than
+filling it with something that is nearly right.
+
 ### It shows you the plan before it writes anything
 
 `sheep ui --rewind`, or `prefix+z`. Pick a turn: every path it would touch is split into what gets
