@@ -1,0 +1,94 @@
+name: Bug report
+description: Something Sheep did that it should not have
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        If Sheep destroyed or overwrote something, please read
+        [SECURITY.md](https://github.com/gokay-ai/sheep/blob/main/SECURITY.md) first and report it privately instead.
+
+        The limits in [docs/known-limitations.md](https://github.com/gokay-ai/sheep/blob/main/docs/known-limitations.md)
+        are known and deliberate. An issue about one is still welcome — say so and it starts
+        further along.
+
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you expected, and what you got instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: doctor
+    attributes:
+      label: Output of `sheep doctor`
+      description: >-
+        Run it in the worktree this happened in. It reports the worktree kind, the tracked
+        file count, submodules, nested repositories and anything blocking — which is most of
+        what decides whether a report is reproducible.
+      render: console
+    validations:
+      required: true
+
+  - type: dropdown
+    id: midop
+    attributes:
+      label: Was the tree mid-operation?
+      description: >-
+        A rebase, merge, cherry-pick, revert or bisect in flight, or unresolved conflicts.
+        Sheep refuses these on purpose, so "yes" usually changes what the bug is.
+      options:
+        - "No"
+        - "Yes — rebase"
+        - "Yes — merge"
+        - "Yes — cherry-pick, revert or bisect"
+        - "Yes — unresolved conflicts in the index"
+        - "Not sure"
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: How to reproduce it
+      description: A shell script starting from `git init` is ideal. Set `SHEEP_STATE_DIR` in it.
+      render: bash
+
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: "`sheep --version`, or the commit you built."
+    validations:
+      required: true
+
+  - type: input
+    id: platform
+    attributes:
+      label: Platform
+      description: "Linux or macOS, architecture, and `git --version`."
+    validations:
+      required: true
+
+  - type: dropdown
+    id: how
+    attributes:
+      label: How were you running Sheep?
+      options:
+        - The CLI on its own
+        - The herdr plugin — the recorder (`sheep watch`)
+        - The herdr plugin — the dock or the rewind overlay
+        - Both
+    validations:
+      required: true
+
+  - type: textarea
+    id: log
+    attributes:
+      label: Recorder log
+      description: >-
+        If the recorder was involved, the relevant lines from
+        `<state>/logs/watch.log`. `bash herdr-plugin/scripts/watchd.sh status` names the file.
+      render: console

@@ -1,0 +1,27 @@
+name: Feature request
+description: Something Sheep should do and does not
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to do?
+      description: The situation, not the solution. What happened instead of what you wanted.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What should Sheep do?
+    validations:
+      required: true
+
+  - type: textarea
+    id: safety
+    attributes:
+      label: Does it write to anyone's files?
+      description: >-
+        If so, say what it would overwrite or remove, and how a user would see that before it
+        happened. The eight safety invariants in [AGENTS.md](https://github.com/gokay-ai/sheep/blob/main/AGENTS.md) are not
+        negotiable, and a feature that needs one relaxed needs an argument for it.
