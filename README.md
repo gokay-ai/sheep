@@ -27,11 +27,18 @@ Linux and macOS.
 herdr plugin install gokay-ai/sheep/herdr-plugin
 ```
 
-The installer fetches a checksum-verified binary, starts the recorder, and registers the dock.
-No Rust needed. Without herdr, `sheep` still works in any git checkout.
+The installer fetches a checksum-verified binary, starts the recorder, registers the dock,
+puts `sheep` on PATH at `~/.local/bin/sheep`, and binds `prefix+F` (dock) and `prefix+f`
+(rewind) in your herdr config. No Rust needed. Those chords are not herdr defaults, so
+zoom stays on `prefix+z`.
 
-Paste [`herdr-plugin/keybindings.toml`](herdr-plugin/keybindings.toml) into
-`~/.config/herdr/config.toml` for `prefix+Z` (dock) and `prefix+z` (rewind).
+If the shell says `command not found`, `~/.local/bin` is not on PATH — herdr's own installer
+adds it; open a new terminal, or add it yourself. If a herdr session is already running,
+`herdr server reload-config` picks up the keys.
+
+Without herdr, download a release asset onto PATH, or
+`cargo install --git https://github.com/gokay-ai/sheep --locked`. `sheep` still works in any
+git checkout.
 
 ## Usage
 
@@ -81,7 +88,15 @@ so the undo is itself undoable.
 herdr plugin uninstall sheep
 ```
 
-Then `rm -rf` the directory `sheep doctor` prints as `state`. Your `.git` is never written.
-Ignored files (`.env`, `node_modules/`) are never captured and never overwritten.
+The CLI on PATH is left in place, so `sheep doctor` still prints `state`. The keybindings
+stay in `~/.config/herdr/config.toml` until you delete the `sheep-keys` block. Then:
+
+```bash
+rm -rf <that state directory>
+rm -f ~/.local/bin/sheep
+```
+
+Your `.git` is never written. Ignored files (`.env`, `node_modules/`) are never captured and
+never overwritten.
 
 MIT. How it works: [`docs/architecture.md`](docs/architecture.md). Contributing: [`AGENTS.md`](AGENTS.md).

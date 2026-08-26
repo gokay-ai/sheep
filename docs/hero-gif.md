@@ -40,7 +40,7 @@ tail -f ~/.local/state/herdr/plugins/sheep/logs/watch.log
 #    Let it finish. Do not review it. That is the point.
 ```
 
-Open the dock with `prefix+Z` and leave it open. The frame you are filming is
+Open the dock with `prefix+F` and leave it open. The frame you are filming is
 the agent pane on the left, the dock on the right, both already on screen.
 
 ## The eight seconds
@@ -48,7 +48,7 @@ the agent pane on the left, the dock on the right, both already on screen.
 | t | what is on screen | what you do |
 |---|---|---|
 | 0.0–1.2 | Left: the agent's last message, "Refactored 9 files." Right: the dock, `#12 turn claude · 9 files +214 −186` at the top, the bar wider than every row under it. | Nothing. Let it sit. The viewer needs a second to read the two panes as two panes. |
-| 1.2–2.0 | The dock's turn list. | Press `prefix+z`. The rewind overlay opens over the dock on `#12`. |
+| 1.2–2.0 | The dock's turn list. | Press `prefix+f`. The rewind overlay opens over the dock on `#12`. |
 | 2.0–3.0 | The overlay: `rewind to #12`, the file list, the footer. | Press `j` three times, one keystroke every ~250 ms, down to `#9` — the last turn you know was good. The header re-reads `rewind to #9` and the file count changes under it. |
 | 3.0–4.2 | `will be written (9)`, then `will be removed (1)`. The footer: *restoring rewrites 9 files and deletes 1 file under \<repo\>/*. | Press `d`. The diff for the selected file opens under the list. Let one screenful of red and green land. |
 | 4.2–5.0 | The footer's second line: *the tree you have now is snapshotted first as a new turn, so this is undoable.* | Nothing. This is the line that sells the tool. Hold it. |

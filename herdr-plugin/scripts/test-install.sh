@@ -186,6 +186,158 @@ else
   failures=$((failures + 1))
 fi
 
+# Test mode must not plant a binary in the developer's ~/.local/bin. The fake
+# asset is a shell script that echoes a version; if that landed on the real
+# PATH, the installer wrote outside the sandbox.
+if [ -f "${HOME:-}/.local/bin/sheep" ] && grep -q "echo \"sheep $version\"" "$HOME/.local/bin/sheep"; then
+  echo "FAIL  test mode wrote the fake binary to $HOME/.local/bin/sheep" >&2
+  failures=$((failures + 1))
+else
+  printf 'ok    test mode does not write to ~/.local/bin\n'
+fi
+
+# --- PATH command ------------------------------------------------------------
+# The README tells people to run `sheep doctor` after plugin install. That
+# only works if a `sheep` is on PATH. The plugin root is not. A plugin binary
+# that is already in place with no PATH copy is the shape that failed; the
+# already-installed short-circuit must still make the command.
+
+echo "== PATH command =="
+path_dir="$sandbox/path"
+mkdir -p "$path_dir"
+
+run_installer_path() {
+  SHEEP_TEST_PATH_DIR="$path_dir" run_installer
+}
+
+if run_installer_path >"$sandbox/path.log" 2>&1 && [ -x "$path_dir/sheep" ]; then
+  if grep -q "command is at $path_dir/sheep" "$sandbox/path.log"; then
+    printf 'ok    copies an already-installed binary onto PATH\n'
+  else
+    echo "FAIL  PATH copy exists but the installer did not say so" >&2
+    cat "$sandbox/path.log" >&2
+    failures=$((failures + 1))
+  fi
+else
+  echo "FAIL  an already-installed plugin did not put sheep on PATH" >&2
+  cat "$sandbox/path.log" >&2
+  failures=$((failures + 1))
+fi
+
+if run_installer_path 2>&1 | grep -q "command is at $path_dir/sheep" && [ -x "$path_dir/sheep" ]; then
+  printf 'ok    re-running leaves an up-to-date PATH copy alone\n'
+else
+  echo "FAIL  re-running did not keep the PATH copy" >&2
+  failures=$((failures + 1))
+fi
+
+skip_dir="$sandbox/path-skip"
+mkdir -p "$skip_dir"
+if SHEEP_SKIP_PATH=1 SHEEP_TEST_PATH_DIR="$skip_dir" run_installer >/dev/null 2>&1 &&
+  [ ! -e "$skip_dir/sheep" ]; then
+  printf 'ok    SHEEP_SKIP_PATH leaves PATH alone\n'
+else
+  echo "FAIL  SHEEP_SKIP_PATH still wrote a PATH copy" >&2
+  failures=$((failures + 1))
+fi
+
+foreign="$path_dir/sheep"
+printf '#!/bin/sh\necho not-sheep\n' >"$foreign"
+chmod +x "$foreign"
+if run_installer_path >"$sandbox/foreign.log" 2>&1 &&
+  grep -q "not overwriting" "$sandbox/foreign.log" &&
+  grep -q "not-sheep" "$foreign"; then
+  printf 'ok    refuses to overwrite a file that is not sheep\n'
+else
+  echo "FAIL  a non-sheep file on PATH was overwritten or the refusal was silent" >&2
+  cat "$sandbox/foreign.log" >&2
+  failures=$((failures + 1))
+fi
+
+# --- keybindings -------------------------------------------------------------
+# herdr 0.8 ignores [[keys.command]] in the plugin manifest, so install.sh
+# writes them into config.toml. prefix+f is the chord that is not a herdr
+# default; prefix+z would have stolen zoom.
+
+echo "== keybindings =="
+cfg="$sandbox/herdr/config.toml"
+
+run_installer_keys() {
+  SHEEP_TEST_CONFIG_PATH="$cfg" run_installer
+}
+
+if run_installer_keys >"$sandbox/keys.log" 2>&1 &&
+  grep -q 'key = "prefix+f"' "$cfg" &&
+  grep -q 'key = "prefix+F"' "$cfg" &&
+  grep -q 'command = "sheep.rewind"' "$cfg" &&
+  grep -q 'command = "sheep.dock"' "$cfg"; then
+  printf 'ok    writes prefix+f / prefix+F into a missing config.toml\n'
+else
+  echo "FAIL  installer did not write Sheep's keys into a new config.toml" >&2
+  cat "$sandbox/keys.log" >&2
+  failures=$((failures + 1))
+fi
+
+existing="$sandbox/herdr-existing/config.toml"
+mkdir -p "$(dirname -- "$existing")"
+printf '[keys]\nprefix = "ctrl+g"\n' >"$existing"
+if SHEEP_TEST_CONFIG_PATH="$existing" run_installer >"$sandbox/keys-append.log" 2>&1 &&
+  grep -q 'prefix = "ctrl+g"' "$existing" &&
+  grep -q 'command = "sheep.rewind"' "$existing"; then
+  printf 'ok    appends keys without rewriting the rest of config.toml\n'
+else
+  echo "FAIL  installer rewrote or skipped an existing config.toml" >&2
+  cat "$sandbox/keys-append.log" >&2
+  failures=$((failures + 1))
+fi
+
+if SHEEP_TEST_CONFIG_PATH="$existing" run_installer 2>&1 | grep -q "keys already" &&
+  [ "$(grep -c 'command = "sheep.rewind"' "$existing")" -eq 1 ]; then
+  printf 'ok    re-running does not duplicate the keybindings\n'
+else
+  echo "FAIL  re-running duplicated or dropped the keybindings" >&2
+  failures=$((failures + 1))
+fi
+
+taken="$sandbox/herdr-taken/config.toml"
+mkdir -p "$(dirname -- "$taken")"
+printf '[[keys.command]]\nkey = "prefix+f"\ntype = "shell"\ncommand = "echo other"\n' >"$taken"
+if SHEEP_TEST_CONFIG_PATH="$taken" run_installer >"$sandbox/keys-taken.log" 2>&1 &&
+  grep -q "not overwriting" "$sandbox/keys-taken.log" &&
+  ! grep -q 'command = "sheep.rewind"' "$taken"; then
+  printf 'ok    refuses to overwrite a key another command already holds\n'
+else
+  echo "FAIL  a taken prefix+f was overwritten or the refusal was silent" >&2
+  cat "$sandbox/keys-taken.log" >&2
+  failures=$((failures + 1))
+fi
+
+old="$sandbox/herdr-old/config.toml"
+mkdir -p "$(dirname -- "$old")"
+printf '[keys]\nprefix = "ctrl+g"\n\n# --- sheep-keys ---\n[[keys.command]]\nkey = "prefix+z"\ntype = "plugin_action"\ncommand = "sheep.rewind"\n\n[[keys.command]]\nkey = "prefix+Z"\ntype = "plugin_action"\ncommand = "sheep.dock"\n' >"$old"
+if SHEEP_TEST_CONFIG_PATH="$old" run_installer >"$sandbox/keys-migrate.log" 2>&1 &&
+  grep -q 'prefix = "ctrl+g"' "$old" &&
+  grep -q 'key = "prefix+f"' "$old" &&
+  grep -q 'key = "prefix+F"' "$old" &&
+  ! grep -q 'key = "prefix+z"' "$old" &&
+  [ "$(grep -c 'command = "sheep.rewind"' "$old")" -eq 1 ]; then
+  printf 'ok    migrates an older prefix+z sheep-keys block to prefix+f\n'
+else
+  echo "FAIL  an older prefix+z sheep-keys block was not migrated" >&2
+  cat "$sandbox/keys-migrate.log" >&2
+  cat "$old" >&2
+  failures=$((failures + 1))
+fi
+
+skip_cfg="$sandbox/herdr-skip/config.toml"
+if SHEEP_SKIP_KEYS=1 SHEEP_TEST_CONFIG_PATH="$skip_cfg" run_installer >/dev/null 2>&1 &&
+  [ ! -e "$skip_cfg" ]; then
+  printf 'ok    SHEEP_SKIP_KEYS leaves config.toml alone\n'
+else
+  echo "FAIL  SHEEP_SKIP_KEYS still wrote keybindings" >&2
+  failures=$((failures + 1))
+fi
+
 # A corrupted checksum must refuse, and must leave the good binary in place.
 printf '%064d  %s\n' 0 "$asset" >"$fake_release/SHA256SUMS"
 if run_installer --force >"$sandbox/bad.log" 2>&1; then

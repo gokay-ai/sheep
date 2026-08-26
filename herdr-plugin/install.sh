@@ -1,16 +1,24 @@
 #!/usr/bin/env bash
-# Put a working `sheep` binary at <plugin root>/bin/sheep without needing Rust.
+# Put a working `sheep` binary at <plugin root>/bin/sheep without needing Rust,
+# a copy on PATH so `sheep doctor` is a real shell command afterwards, and
+# Sheep's keys into herdr's config.toml so prefix+F / prefix+f work without a
+# paste step. herdr 0.8 ignores [[keys.command]] in a plugin manifest.
 #
 # herdr runs this as the plugin's [[build]] step on `herdr plugin install`, with
 # cwd = the plugin root and with every HERDR_* runtime variable scrubbed, so the
 # script resolves everything from its own location. It is also fine to run by
 # hand, and re-running it is cheap: an already-installed binary of the right
-# version is left alone.
+# version is left alone. The PATH copy and the keybindings are still refreshed
+# on that path: a plugin that is already in place with no `sheep` on PATH, and
+# no keys in config.toml, is exactly the shape that made the advertised
+# commands fail after a successful install.
 #
 #   ./install.sh                 fetch, verify and install the release binary
 #   ./install.sh --dry-run       print what would be fetched; touch nothing
 #   ./install.sh --from-source   build with cargo instead (needs Rust)
 #   ./install.sh --force         reinstall even if the right version is present
+#   ./install.sh --no-path       do not copy sheep onto PATH (~/.local/bin)
+#   ./install.sh --no-keys       do not write Sheep's keys into herdr's config.toml
 #
 # Exit status is 0 on success and non-zero with a one-line reason on stderr
 # otherwise — herdr shows that line when an install fails.
@@ -49,6 +57,8 @@ fi
 dry_run=0
 from_source=0
 force=0
+skip_path=0
+skip_keys=0
 
 die() {
   echo "sheep: $*" >&2
@@ -56,7 +66,7 @@ die() {
 }
 
 usage() {
-  sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 while [ $# -gt 0 ]; do
@@ -64,6 +74,8 @@ while [ $# -gt 0 ]; do
     --dry-run) dry_run=1 ;;
     --from-source) from_source=1 ;;
     --force) force=1 ;;
+    --no-path) skip_path=1 ;;
+    --no-keys) skip_keys=1 ;;
     -h | --help)
       usage
       exit 0
@@ -74,9 +86,48 @@ while [ $# -gt 0 ]; do
 done
 
 # SHEEP_FROM_SOURCE=1 is the escape hatch for `herdr plugin install`, which runs
-# this script with a fixed argv and no way to pass --from-source.
+# this script with a fixed argv and no way to pass --from-source. SHEEP_SKIP_PATH
+# and SHEEP_SKIP_KEYS are the same shape for --no-path and --no-keys.
 if [ "${SHEEP_FROM_SOURCE:-0}" = 1 ]; then
   from_source=1
+fi
+if [ "${SHEEP_SKIP_PATH:-0}" = 1 ]; then
+  skip_path=1
+fi
+if [ "${SHEEP_SKIP_KEYS:-0}" = 1 ]; then
+  skip_keys=1
+fi
+
+# User-facing `sheep` on PATH. Empty means do not install one: test mode unless
+# SHEEP_TEST_PATH_DIR is set (so test-install.sh cannot plant a binary in the
+# developer's ~/.local/bin), --no-path, or a machine with no HOME.
+path_dir=""
+if [ "$skip_path" != 1 ]; then
+  if [ "$test_mode" = 1 ]; then
+    path_dir=${SHEEP_TEST_PATH_DIR:-}
+  elif [ -n "${XDG_BIN_HOME:-}" ]; then
+    path_dir=$XDG_BIN_HOME
+  elif [ -n "${HOME:-}" ]; then
+    path_dir=$HOME/.local/bin
+  fi
+fi
+
+# herdr's config.toml. Empty means do not write keys: test mode unless
+# SHEEP_TEST_CONFIG_PATH is set (so test-install.sh cannot edit the
+# developer's herdr config), --no-keys, or a machine with no HOME.
+# HERDR_CONFIG_PATH is honoured when present; plugin build scrubs HERDR_*
+# so a real `herdr plugin install` falls through to the XDG path.
+config_path=""
+if [ "$skip_keys" != 1 ]; then
+  if [ "$test_mode" = 1 ]; then
+    config_path=${SHEEP_TEST_CONFIG_PATH:-}
+  elif [ -n "${HERDR_CONFIG_PATH:-}" ]; then
+    config_path=$HERDR_CONFIG_PATH
+  elif [ -n "${XDG_CONFIG_HOME:-}" ]; then
+    config_path=$XDG_CONFIG_HOME/herdr/config.toml
+  elif [ -n "${HOME:-}" ]; then
+    config_path=$HOME/.config/herdr/config.toml
+  fi
 fi
 
 # --- what platform is this, and which asset does it want ---------------------
@@ -166,8 +217,253 @@ if [ "$dry_run" = 1 ]; then
     echo "asset       (none)"
     echo "install to  $out"
   fi
+  if [ -n "$path_dir" ]; then
+    echo "on PATH     $path_dir/$SHEEP_BINARY_NAME$exe_suffix"
+  else
+    echo "on PATH     (none)"
+  fi
+  if [ -n "$config_path" ]; then
+    echo "keys        $config_path"
+  else
+    echo "keys        (none)"
+  fi
   exit 0
 fi
+
+# --- PATH command ------------------------------------------------------------
+
+# Copy the plugin binary onto the user's PATH so `sheep doctor` works after a
+# herdr plugin install. The plugin root is not on PATH; that is the whole
+# problem this exists to close.
+#
+# A copy, not a symlink. `herdr plugin uninstall` deletes the plugin tree, and
+# a dangling `~/.local/bin/sheep` still wins `command -v` and then fails with
+# "No such file or directory", which reads like a broken install. A copy
+# survives uninstall, which is also how `sheep doctor` can still print the
+# state directory the README tells you to delete. The copy is replaced
+# whenever this script installs a sheep of a different version.
+#
+# Never overwrite a file that is not sheep. Never fail the plugin install if
+# the PATH copy cannot be written — the dock and the recorder only need $out.
+install_on_path() {
+  if [ -z "$path_dir" ] || [ ! -x "$out" ]; then
+    return 0
+  fi
+
+  path_cmd="$path_dir/$SHEEP_BINARY_NAME$exe_suffix"
+
+  if [ -d "$path_cmd" ] && [ ! -L "$path_cmd" ]; then
+    echo "sheep: $path_cmd is a directory; leaving it. The binary is at $out."
+    return 0
+  fi
+
+  if [ -e "$path_cmd" ] || [ -L "$path_cmd" ]; then
+    if [ -L "$path_cmd" ] && [ ! -e "$path_cmd" ]; then
+      : # dangling; replace
+    elif [ -x "$path_cmd" ]; then
+      existing_line=$("$path_cmd" --version 2>/dev/null | awk 'NR == 1 { print }')
+      existing_name=$(printf '%s\n' "$existing_line" | awk '{ print $1 }')
+      existing_ver=$(printf '%s\n' "$existing_line" | awk '{ print $NF }')
+      if [ "$existing_name" != "$SHEEP_BINARY_NAME" ]; then
+        echo "sheep: $path_cmd exists and is not sheep; not overwriting. The binary is at $out."
+        return 0
+      fi
+      if [ "$existing_ver" = "$version" ]; then
+        echo "sheep: command is at $path_cmd."
+        hint_if_path_dir_missing
+        return 0
+      fi
+    else
+      echo "sheep: $path_cmd exists and is not sheep; not overwriting. The binary is at $out."
+      return 0
+    fi
+  fi
+
+  if ! mkdir -p "$path_dir" 2>/dev/null; then
+    echo "sheep: could not create $path_dir; run $out directly, or copy it onto PATH."
+    return 0
+  fi
+  # Drop a leftover symlink so cp cannot write through it into the plugin tree.
+  if [ -L "$path_cmd" ]; then
+    rm -f "$path_cmd"
+  fi
+  if ! cp -f "$out" "$path_cmd" 2>/dev/null; then
+    echo "sheep: could not write $path_cmd; run $out directly, or copy it onto PATH."
+    return 0
+  fi
+  chmod +x "$path_cmd" 2>/dev/null || true
+  echo "sheep: command is at $path_cmd."
+  hint_if_path_dir_missing
+}
+
+hint_if_path_dir_missing() {
+  case ":$PATH:" in
+    *":$path_dir:"*) return 0 ;;
+  esac
+  echo "sheep: $path_dir is not on PATH. Add it and open a new terminal, then sheep doctor will work."
+}
+
+# True when an uncommented line of $1 contains $2. Comments are not bindings.
+config_contains() {
+  file=$1
+  needle=$2
+  [ -f "$file" ] || return 1
+  awk -v n="$needle" '
+    /^[[:space:]]*#/ { next }
+    index($0, n) { found = 1; exit }
+    END { exit found ? 0 : 1 }
+  ' "$file"
+}
+
+# Write prefix+f / prefix+F into herdr's config.toml. herdr 0.8 reads
+# keybindings from that file alone: the identical [[keys.command]] tables in
+# herdr-plugin.toml are accepted by the manifest loader and never reach the
+# key map (herdrdev/herdr#1368). That is why a successful plugin install
+# still left the advertised keys doing nothing until the user pasted them.
+#
+# prefix+f is not a herdr default (zoom stays on prefix+z). The sheep-keys
+# block is ours: if an older install wrote prefix+z here, a re-run replaces
+# that block rather than leaving a zoom collision in place. A command that is
+# not ours and already holds prefix+f is left alone. Back up first, and if
+# `herdr config check` rejects the result, put the backup back. A failure
+# here does not fail the plugin install — the dock and the recorder do not
+# need the keys. Test mode writes only when SHEEP_TEST_CONFIG_PATH is set.
+sheep_keys_are_current() {
+  file=$1
+  config_contains "$file" 'command = "sheep.rewind"' || return 1
+  config_contains "$file" 'command = "sheep.dock"' || return 1
+  config_contains "$file" 'key = "prefix+f"' || return 1
+  config_contains "$file" 'key = "prefix+F"' || config_contains "$file" 'key = "prefix+shift+f"'
+}
+
+sheep_key_is_taken() {
+  file=$1
+  config_contains "$file" 'key = "prefix+f"' ||
+    config_contains "$file" 'key = "prefix+F"' ||
+    config_contains "$file" 'key = "prefix+shift+f"'
+}
+
+install_keybindings() {
+  if [ -z "$config_path" ]; then
+    return 0
+  fi
+
+  keys_file="$plugin_root/keybindings.toml"
+  [ -f "$keys_file" ] || {
+    echo "sheep: $keys_file is missing; not writing keybindings."
+    return 0
+  }
+
+  if [ -d "$config_path" ]; then
+    echo "sheep: $config_path is a directory; not writing keybindings."
+    return 0
+  fi
+
+  mode=create
+  if [ -f "$config_path" ]; then
+    if sheep_keys_are_current "$config_path"; then
+      echo "sheep: keys already in $config_path."
+      return 0
+    fi
+    if grep -q '# --- sheep-keys ---' "$config_path"; then
+      if sheep_key_is_taken "$config_path"; then
+        echo "sheep: prefix+f or prefix+F is already bound in $config_path; not overwriting."
+        return 0
+      fi
+      mode=replace
+    elif config_contains "$config_path" 'command = "sheep.rewind"' &&
+      config_contains "$config_path" 'command = "sheep.dock"'; then
+      echo "sheep: keys already in $config_path."
+      return 0
+    elif sheep_key_is_taken "$config_path"; then
+      echo "sheep: prefix+f or prefix+F is already bound in $config_path; not overwriting."
+      return 0
+    else
+      mode=append
+    fi
+  fi
+
+  config_dir=$(dirname -- "$config_path")
+  if ! mkdir -p "$config_dir" 2>/dev/null; then
+    echo "sheep: could not create $config_dir; bind prefix+F yourself from $keys_file."
+    return 0
+  fi
+
+  new_file="$config_path.sheep-new"
+  backup=""
+  if [ -f "$config_path" ]; then
+    backup="$config_path.sheep-bak"
+    if ! cp -f "$config_path" "$backup" 2>/dev/null; then
+      echo "sheep: could not back up $config_path; not writing keybindings."
+      return 0
+    fi
+  fi
+
+  case "$mode" in
+    create)
+      if ! cp -f "$keys_file" "$new_file" 2>/dev/null; then
+        echo "sheep: could not write $config_path; bind prefix+F yourself from $keys_file."
+        return 0
+      fi
+      ;;
+    append)
+      if ! {
+        cat "$config_path"
+        printf '\n'
+        cat "$keys_file"
+        printf '\n'
+      } >"$new_file" 2>/dev/null; then
+        echo "sheep: could not write $config_path; not changing keybindings."
+        rm -f "$new_file"
+        return 0
+      fi
+      ;;
+    replace)
+      # The marked block is ours. Drop it and write the current one, so an
+      # older prefix+z install does not keep stealing herdr's zoom.
+      if ! {
+        awk '/^# --- sheep-keys ---$/ { exit } { print }' "$config_path"
+        cat "$keys_file"
+        printf '\n'
+      } >"$new_file" 2>/dev/null; then
+        echo "sheep: could not write $config_path; not changing keybindings."
+        rm -f "$new_file"
+        return 0
+      fi
+      ;;
+    *)
+      echo "sheep: internal error: unknown keybinding mode '$mode'."
+      rm -f "$new_file"
+      return 0
+      ;;
+  esac
+
+  if ! mv -f "$new_file" "$config_path" 2>/dev/null; then
+    echo "sheep: could not replace $config_path; not changing keybindings."
+    rm -f "$new_file"
+    return 0
+  fi
+
+  if [ "$test_mode" != 1 ] && command -v herdr >/dev/null 2>&1; then
+    if ! herdr config check >/dev/null 2>&1; then
+      echo "sheep: herdr rejected the keybinding edit; restored $config_path."
+      if [ -n "$backup" ] && [ -f "$backup" ]; then
+        mv -f "$backup" "$config_path" 2>/dev/null || true
+      else
+        rm -f "$config_path"
+      fi
+      return 0
+    fi
+    herdr server reload-config >/dev/null 2>&1 || true
+  fi
+
+  echo "sheep: bound prefix+f (rewind) and prefix+F (dock) in $config_path."
+}
+
+finish_install() {
+  install_on_path
+  install_keybindings
+}
 
 # --- source build ------------------------------------------------------------
 
@@ -191,6 +487,7 @@ build_from_source() {
   cp -f "$built" "$out"
   chmod +x "$out"
   echo "sheep: installed a source build at $out."
+  finish_install
 }
 
 if [ "$from_source" = 1 ]; then
@@ -211,6 +508,7 @@ if [ "$force" != 1 ] && [ -x "$out" ]; then
   installed=$("$out" --version 2>/dev/null | awk 'NR == 1 { print $NF }')
   if [ "$installed" = "$version" ]; then
     echo "sheep: v$version is already installed at $out."
+    finish_install
     exit 0
   fi
 fi
@@ -285,3 +583,4 @@ chmod +x "$tmpdir/$asset"
 mv -f "$tmpdir/$asset" "$out" || die "could not install the verified binary at $out"
 
 echo "sheep: installed verified v$version ($triple) at $out."
+finish_install

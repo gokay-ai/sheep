@@ -1,20 +1,19 @@
-# Sheep's keybindings, ready to paste into ~/.config/herdr/config.toml.
-#
-# They live here rather than only in herdr-plugin.toml because herdr 0.8 reads
-# keybindings from the user's config.toml alone: the plugin manifest loader has
-# no `keys` field, so the identical block in herdr-plugin.toml is accepted but
-# never reaches the key map. Paste this in and run `herdr server reload-config`.
-#
-# `prefix` is whatever your config's prefix key is (Ctrl+a out of the box).
+# --- sheep-keys ---
+# Appended to ~/.config/herdr/config.toml by herdr-plugin/install.sh.
+# herdr 0.8 does not load [[keys.command]] from a plugin manifest, so these
+# live in your config. prefix+f is rewind, prefix+F is the dock — neither is a
+# herdr default (zoom stays on prefix+z). Delete this block and run
+# `herdr server reload-config` to drop the bindings; uninstalling the plugin
+# does not remove them.
 
 [[keys.command]]
-key = "prefix+z"
+key = "prefix+f"
 type = "plugin_action"
 command = "sheep.rewind"
 description = "rewind this agent"
 
 [[keys.command]]
-key = "prefix+Z"
+key = "prefix+F"
 type = "plugin_action"
 command = "sheep.dock"
 description = "show the Sheep timeline"

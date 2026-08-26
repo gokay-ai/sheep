@@ -67,8 +67,15 @@ no `sha256sum`/`shasum` is available. Be clear about what that buys: the checksu
 same GitHub release as the binary, so it defends against a truncated or corrupted download and
 against a swapped individual asset — not against a compromised GitHub account or a compromised
 release workflow. The download origin is not redirectable by an environment variable on a real
-install. `./install.sh --from-source` builds with cargo instead if you would rather not trust a
-prebuilt binary.
+install. The same verified binary is copied to `~/.local/bin/sheep` so `sheep` is a shell
+command; a file that is not sheep is left alone, and a failure to write the copy does not fail
+the plugin install. The installer also appends `prefix+f` / `prefix+F` to herdr's
+`config.toml` (herdr 0.8 ignores keybindings in the plugin manifest). It will not overwrite a
+key another command already holds; it copies the file to `config.toml.sheep-bak` first and
+puts that back if `herdr config check` rejects the result. `./install.sh --from-source`
+builds with cargo instead if you would rather not trust a prebuilt binary.
+`./install.sh --no-path` / `SHEEP_SKIP_PATH=1` skips the PATH copy;
+`./install.sh --no-keys` / `SHEEP_SKIP_KEYS=1` skips the keybindings.
 
 **The recorder talks to herdr's socket.** `sheep watch` connects to `$HERDR_SOCKET_PATH` and takes
 pane status, working directories and pane text from it. Anything that can write to that socket can

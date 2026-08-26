@@ -139,7 +139,7 @@ command = ["bash", "scripts/sheep-run.sh", "doctor"]
 # screen uninvited gets uninstalled. What must not be missed is the RECORDING —
 # a turn that happens while the recorder is down is gone for good. So these
 # hooks heal the recorder (a background daemon that can steal nothing) and leave
-# the dock to `prefix+Z`, which is one keystroke away and asked for.
+# the dock to `prefix+F`, which is one keystroke away and asked for.
 #
 # `worktree.created` fires when herdr cuts a new worktree for an agent — the
 # exact moment a new timeline starts existing. `workspace.created` covers the
@@ -161,17 +161,18 @@ command = ["bash", "scripts/watchd.sh", "start"]
 # put `[[keys.command]]` in this file. Be aware of the drift: herdr 0.8 reads
 # keybindings from the user's `config.toml` only (`src/config/keybinds.rs`); the
 # manifest loader has no `keys` field and ignores unknown tables, so these two
-# entries are accepted but inert. `keybindings.toml` next to this file is the
-# same two bindings ready to paste into `~/.config/herdr/config.toml`.
+# entries are accepted but inert. `install.sh` appends the same block from
+# `keybindings.toml` into the user's config.toml, which is what makes
+# prefix+F / prefix+f work after `herdr plugin install` with no paste step.
 
 [[keys.command]]
-key = "prefix+z"
+key = "prefix+f"
 type = "plugin_action"
 command = "sheep.rewind"
 description = "rewind this agent"
 
 [[keys.command]]
-key = "prefix+Z"
+key = "prefix+F"
 type = "plugin_action"
 command = "sheep.dock"
 description = "show the Sheep timeline"

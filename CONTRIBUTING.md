@@ -32,7 +32,7 @@ is which. `fmt`, `clippy` and `test` run on **Linux and macOS** both. `shellchec
 plugin scripts are a single **Linux-only** job:
 
 ```bash
-bash herdr-plugin/scripts/test-install.sh    # the installer and the release matrix agree on every asset name
+bash herdr-plugin/scripts/test-install.sh    # the installer, PATH copy, keybindings, and the release matrix agree
 bash herdr-plugin/scripts/test-watchd.sh     # exactly one recorder survives eight concurrent starts
 ```
 
@@ -63,8 +63,8 @@ build steps, and [`herdr-plugin/scripts/common.sh`](herdr-plugin/scripts/common.
 `../target/release/sheep` and then `../target/debug/sheep`, so a `cargo build --release` in the
 repository root is enough for the panes and actions to find your binary.
 
-`bash herdr-plugin/install.sh --dry-run` prints the platform, target and asset URL it would use and
-touches nothing.
+`bash herdr-plugin/install.sh --dry-run` prints the platform, target, asset URL, PATH
+destination and herdr config path it would use and touches nothing.
 
 ## The bar for anything that writes to a user's files
 

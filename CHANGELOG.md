@@ -42,11 +42,14 @@ Nothing has been tagged yet. This is what `v0.1.0` will contain.
 ### The herdr plugin
 
 - `herdr plugin install gokay-ai/sheep/herdr-plugin` installs a checksum-verified prebuilt binary,
-  registers the dock, the rewind overlay and the recorder, and never needs Rust.
-  `--from-source` builds with cargo instead.
-- `herdr-plugin/keybindings.toml` is `prefix+Z` and `prefix+z`, ready to paste into
-  `~/.config/herdr/config.toml`. herdr 0.8 reads keybindings from your own config, not from a plugin
-  manifest.
+  registers the dock, the rewind overlay and the recorder, puts `sheep` on PATH, binds
+  `prefix+F` / `prefix+f` in herdr's config.toml, and never needs Rust. `--from-source`
+  builds with cargo instead.
+- herdr 0.8 ignores `[[keys.command]]` in a plugin manifest, so the installer writes
+  [`herdr-plugin/keybindings.toml`](herdr-plugin/keybindings.toml) into the user's config.
+  `prefix+f` (rewind) and `prefix+F` (dock) are not herdr defaults, so zoom stays on
+  `prefix+z`. A key another command already holds is left alone. An older install
+  that wrote `prefix+z` is migrated on re-run.
 
 ### Platforms
 

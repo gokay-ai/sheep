@@ -33,7 +33,7 @@ toolchain and `git` on `PATH`.
 The plugin half has its own two scripts, run by CI and runnable by hand:
 
 ```bash
-bash herdr-plugin/scripts/test-install.sh     # installer platform detection vs the release matrix
+bash herdr-plugin/scripts/test-install.sh     # installer platform detection, PATH copy, keybindings, release matrix
 bash herdr-plugin/scripts/test-watchd.sh      # "exactly one recorder" under concurrent starts
 ```
 
