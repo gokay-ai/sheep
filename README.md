@@ -12,11 +12,13 @@
 Sheep is what you reach for when one of them wanders off.
 
 Not the whole flock rounded up, and not the field burned down and reseeded — that one animal, walked
-back to where it was, while the rest carry on grazing. An agent rewrites nine files in one turn and
-gets three of them wrong; `git checkout .` is the burnt field, because it takes the last four good
-turns with the bad one and it cannot tell the agent anything. Sheep puts **that** worktree back to a
-turn you pick, leaves the other agents grazing, and then tells the agent what was taken back — so it
-re-reads the files instead of cheerfully re-applying the edit you just reverted.
+back to where it was, while the rest carry on grazing.
+
+An agent rewrites nine files in one turn and gets three of them wrong. `git checkout .` is the burnt
+field: it takes the last four good turns along with the bad one, and it cannot tell the agent
+anything. Sheep puts **that** worktree back to a turn you pick, leaves every other agent exactly
+where it was, and then tells the agent what was taken back — so it re-reads the files instead of
+cheerfully re-applying the edit you just reverted.
 
 ```bash
 herdr plugin install gokay-ai/sheep/herdr-plugin
@@ -48,9 +50,10 @@ timeline claude · 5 turns · newest 43s ago · notify on
 j/k move · enter rewind · ? keys · q quit · n notify · r refresh
 ```
 
-<sup>`sheep ui --snapshot 92x18`. Every frame in this README is real output — `--snapshot` draws one
-frame into an off-screen buffer and prints it as text, so what you are looking at is reviewable in a
-pull request and assertable in CI.</sup>
+<sup>`sheep ui --snapshot 92x18`. Every frame here is real output: `--snapshot` draws one frame of the
+interface into an off-screen buffer and prints it as text, so what you are looking at is reviewable
+in a pull request and assertable in CI. These five turns were recorded by hand with `sheep snap`,
+which is why they read `manual` — the recorder labels its own `turn`.</sup>
 
 ## "Claude Code already has `/rewind`"
 
@@ -160,8 +163,22 @@ The message that lands in the agent's pane after a restore:
 > before you edit it, and do not re-apply the reverted changes unless you are asked to. The state
 > from just before the rewind was kept as turn #6; `sheep restore #6 --yes` puts it back.
 
-Outside herdr this is a no-op by construction rather than by a branch, so the interface behaves
-identically in a plain terminal.
+The timeline it left behind says the same thing twice — once as the checkpoint that makes the rewind
+reversible, once as the turn that records where you landed:
+
+```console
+$ sheep log
+#7    9ba4396fb2cf  manual       10 files  +75     -10     restored to f944f1ef431a
+#6    9766acafdf0d  checkpoint    0 files  +0      -0      before restore to f944f1ef431a
+#5    90f73711129f  manual       10 files  +10     -75     extract the retry helper and use it everywhere
+#4    f944f1ef431a  manual        1 files  +1      -1      lower the reconnect ceiling to 20s
+#3    f0154c288942  manual        2 files  +3      -0      add a theme helper
+#2    19540f92756b  manual        1 files  +2      -0      cap the note length
+#1    2f0e1798bda6  manual       60 files  +0      -0      start of session
+```
+
+Outside herdr the message is a no-op by construction rather than by a branch, so the interface
+behaves identically in a plain terminal.
 
 ## What Sheep never touches
 
@@ -261,21 +278,26 @@ checkpoint that reverses it.
 
 ## What it costs
 
-Borrowed objects are the whole trick, and the numbers are the reason to bother:
+Borrowed objects are the whole trick. Measured on this machine, with `SHEEP_STATE_DIR` pointed at a
+scratch directory each time:
+
+| | snapshot | plan (`sheep diff`) | restore |
+|---|---|---|---|
+| this repository — 60 tracked files | 0.11 s | 0.08 s | 0.27 s |
+| a synthetic checkout — 12,000 files, 132 MB | 1.5 s | 1.5 s | 5.9 s |
+
+And what it keeps:
 
 | | |
 |---|---|
-| two checkouts, 2.5 GB on disk between them, six recorded turns | **216 KB** of Sheep state |
-| a 12,000-file, 154 MB checkout — first snapshot | 1.6 s |
-| the same checkout, every snapshot after that | ~1.5 s |
-| `sheep diff` on it (the plan; writes nothing) | ~1.5 s |
-| `sheep restore` on it | ~6.9 s |
-| this repository, 60 tracked files — a snapshot | 0.17 s |
+| five recorded turns on that 12,000-file checkout | **512 KB** of state |
+| two everyday checkouts, 2.5 GB on disk between them — mostly ignored build output — six turns | **216 KB** of state |
 
-A snapshot re-stages the whole tree into a fresh index, so its *time* tracks the size of the checkout
-rather than the size of the change; what gets *stored* tracks the change. A restore stages three more
-times — once to compute the plan, once for the checkpoint that makes it undoable, once to record
-where you landed — which is where the six seconds go, and none of the three is optional.
+A snapshot re-stages the whole tree into a fresh index, so the *time* tracks the size of the checkout
+and not the size of the change; what gets *stored* tracks the change, because everything your
+repository already holds is borrowed rather than copied. A restore stages three more times — once to
+compute the plan, once for the checkpoint that makes it undoable, once to record where you landed —
+which is where the six seconds on the big fixture go, and none of the three is optional.
 
 `sheep gc` is the one command worth knowing about ahead of time. Trimming the turn log alone frees
 nothing, because every old commit stays reachable through the parent chain; `gc` rebuilds the kept
@@ -285,6 +307,21 @@ to exactly the same bytes, which is what
 `--max-age-days 30` by default, dry run unless `--yes`.
 
 ## Commands
+
+The whole tool, in the order you would meet it. None of this needs herdr — `sheep` works in any git
+checkout on its own, and the plugin is what makes it automatic.
+
+```bash
+sheep doctor           # can Sheep record here, and what will it leave alone
+sheep snap             # record the working tree as a turn
+sheep log              # the timeline
+sheep diff 4           # what going back to turn 4 would do. Writes nothing
+sheep restore 4 --yes  # go back. Without --yes it prints the plan and stops
+sheep ui --rewind      # the same decision, with the diff in front of you
+sheep gc --yes         # shorten history: rebuild the kept turns, then collect
+```
+
+A turn is named by its number, by `'#4'` if you quote it past your shell, or by its commit id.
 
 ```console
 $ sheep -h
