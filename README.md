@@ -451,9 +451,10 @@ cargo test                   # 218 tests
 cargo clippy --all-targets -- -D warnings && cargo fmt --check
 ```
 
-CI runs fmt, clippy and the tests on Linux and macOS, plus shellcheck and an installer round trip
-that asserts `install.sh` and the release matrix ask for exactly the same asset names. Releases are
-built natively for five targets with one `SHA256SUMS`.
+CI runs fmt, clippy and the tests on Linux and macOS — the two platforms Sheep claims — plus
+shellcheck, an installer round trip that asserts `install.sh` and the release matrix ask for exactly
+the same asset names, and eight concurrent `watchd start`s that have to leave exactly one recorder
+running. Releases are built natively for five targets with one `SHA256SUMS`.
 
 ## What Sheep does not do
 
