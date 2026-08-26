@@ -47,12 +47,6 @@ Most of the suite needs nothing but `git`. The recorder and the interface are te
 scripted herdr and `ratatui`'s `TestBackend`, so no pseudo-terminal and no herdr session is
 involved anywhere in CI.
 
-One exception, and it will bite you rather than CI: `wire::live_session_answers_ping` no-ops unless
-`wire::inside_herdr()`, so when you run `cargo test` **from inside a herdr pane** it pings your real
-herdr server. On a loaded machine that server sometimes hangs up without replying, and the test
-fails on something that is not your change. If you see only that one red, re-run, or
-`cargo test -- --skip live_session_answers_ping`.
-
 ## Trying your change by hand
 
 **Always redirect the state directory.** Without it you are writing turns into the timelines on
