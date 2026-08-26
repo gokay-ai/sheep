@@ -185,6 +185,16 @@ impl Herdr {
         }
     }
 
+    /// Answer about the pane, but without a working directory — herdr being
+    /// terse rather than reporting a move. It is also what drops the pane's
+    /// directory out of `agent.list`, which is what expires the recorder's
+    /// cached answer for it.
+    fn forget_cwd(&self, pane_id: &str) {
+        if let Some(pane) = self.0.lock().unwrap().panes.get_mut(pane_id) {
+            pane.cwd = None;
+        }
+    }
+
     /// Answer nothing at all for a pane that is nonetheless there.
     fn answer_nothing_for(&self, pane_id: &str) {
         self.0.lock().unwrap().silent.push(pane_id.to_string());
@@ -385,6 +395,39 @@ fn run(herdr: &Herdr, state: &Path, dry_run: bool, steps: Vec<Step>) -> Recorder
     recorder
 }
 
+/// The same, with a patience ceiling far beyond anything the machine can do to
+/// the schedule.
+///
+/// `PATIENCE_MS` is 500 so that the tests about *giving up* do not take a
+/// minute each, and it is a ceiling on the whole corroboration — retries
+/// included. A test whose subject is what happens across two settle windows is
+/// then two things at once: the check it means to exercise, and a race against
+/// that ceiling, which a loaded machine can win. Where the ceiling is not the
+/// subject, take it out of the picture.
+fn run_patient(herdr: &Herdr, state: &Path, steps: Vec<Step>) -> Recorder<Herdr> {
+    let mut config = config(state, false);
+    config.tuning.patience = Duration::from_secs(30);
+    let mut recorder = Recorder::new(herdr.clone(), config, Log::to_stdout());
+    let _ = recorder.pump(&mut Script::new(steps));
+    recorder
+}
+
+/// The same, with the periodic re-sync actually firing. The default config
+/// pushes it an hour out so it never interferes; a test about what reconcile
+/// does to cached state needs it to run.
+fn run_reconciling(
+    herdr: &Herdr,
+    state: &Path,
+    every: Duration,
+    steps: Vec<Step>,
+) -> Recorder<Herdr> {
+    let mut config = config(state, false);
+    config.reconcile_every = every;
+    let mut recorder = Recorder::new(herdr.clone(), config, Log::to_stdout());
+    let _ = recorder.pump(&mut Script::new(steps));
+    recorder
+}
+
 fn tweak(herdr: &Herdr, change: impl Fn(&Herdr) + Send + 'static) -> Step {
     let handle = herdr.clone();
     Step::Do(Box::new(move || change(&handle)))
@@ -473,6 +516,156 @@ fn a_pane_still_spawning_processes_is_not_finished() {
 
     let turns = ground.recorded(&repo, "claude");
     assert_eq!(turns.len(), 1, "the turn lands once the process group settles: {turns:?}");
+}
+
+#[test]
+fn a_turn_filed_while_the_agent_was_still_writing_holds_the_wrong_tree() {
+    // The consequence of the process-group check, rather than the fact of it.
+    // Herdr says the pane is at rest while the agent is still spawning and
+    // reaping tools; if that is believed, the snapshot is taken over a tree the
+    // agent is halfway through writing, and the turn a user rewinds to is a
+    // state that never existed. The window re-arms, so the only cost of
+    // waiting is a few hundred milliseconds.
+    //
+    // The existing test for this asserts `turns.len() == 1`, which is also what
+    // filing immediately produces — which is how the check survived deletion.
+    let ground = Ground::new();
+    let repo = ground.repo("work");
+    let herdr = Herdr::default();
+    herdr
+        .pane("w1:p1", "claude", &repo, Status::Idle)
+        .screen("w1:p1", "❯ rewrite the parser\n")
+        // The fingerprint at the candidate, a tool child that has gone by the
+        // time the window closes, then a group that stays put.
+        .processes(
+            "w1:p1",
+            vec![agent_running(&[4_200, 4_300]), agent_running(&[4_200]), agent_running(&[4_200])],
+        );
+
+    let mut steps = one_turn("w1:p1", "claude", &repo, 10, "fn main() { /* half written */ }\n");
+    // The agent finishes the file it was in the middle of, after herdr had
+    // already called the pane idle.
+    steps.push(edit(repo.join("src.rs"), "fn main() { /* finished */ }\n"));
+    steps.push(Step::Rest(SETTLE_MS * 3));
+
+    run_patient(&herdr, &ground.state, steps);
+
+    let turns = ground.recorded(&repo, "claude");
+    assert_eq!(turns.len(), 1, "the turn lands once the process group settles: {turns:?}");
+
+    // The property: what was recorded is what is on disk now, not the half
+    // written file. A plan from the recorded turn to the working tree is empty
+    // exactly when the two agree.
+    let wt = Worktree::discover(&repo).unwrap();
+    let planned =
+        sheep::ops::plan(&wt, &ground.state, "claude", &turns[0].seq.to_string(), BUDGET).unwrap();
+    assert!(
+        planned.plan.is_noop(),
+        "#{} is a tree the agent was halfway through writing: restoring it would change {:?}",
+        turns[0].seq,
+        planned.plan.write
+    );
+}
+
+#[test]
+fn a_turn_is_not_filed_for_a_program_that_is_no_longer_there() {
+    // The other half of the fingerprint. The agent was restarted inside the
+    // pane: same shell, new leader pid. Whatever turn was in flight belonged to
+    // a program that has exited, and there is no honest tree to record for it —
+    // so it is dropped, not recorded late against whatever the new process
+    // leaves on disk.
+    //
+    // Without the leader check the changed pid set reads as "still spawning",
+    // the recorder waits one more window, the group is stable by then, and the
+    // turn lands anyway.
+    let ground = Ground::new();
+    let repo = ground.repo("work");
+    let herdr = Herdr::default();
+    herdr
+        .pane("w1:p1", "claude", &repo, Status::Idle)
+        .screen("w1:p1", "❯ do the thing\n")
+        // Fingerprint at the candidate, then a different program holding the
+        // pane for every look afterwards.
+        .processes("w1:p1", vec![agent_running(&[4_200]), restarted_agent()]);
+
+    let mut steps = one_turn("w1:p1", "claude", &repo, 10, "fn main() { /* mid flight */ }\n");
+    // Long enough for a second window to close, which is where the turn used
+    // to arrive.
+    steps.push(Step::Rest(SETTLE_MS * 3));
+
+    // Patient, so that running out of patience is not what produces the
+    // answer: the point is that the turn is dropped on its merits.
+    let recorder = run_patient(&herdr, &ground.state, steps);
+
+    assert!(
+        ground.recorded(&repo, "claude").is_empty(),
+        "a turn cannot be filed for an agent process that is gone: {:?}",
+        ground.recorded(&repo, "claude")
+    );
+    assert_eq!(recorder.recorded(), 0);
+    assert!(herdr.reported().is_empty(), "and herdr is not told a turn number");
+}
+
+#[test]
+fn a_turn_is_refused_when_its_directory_became_a_different_worktree() {
+    // The backstop that shares no reasoning with the detector's. The pane never
+    // moves — every directory check compares the same string against itself and
+    // agrees — but the directory itself becomes a different worktree while the
+    // turn is in flight, because the agent ran `git init` in it. The baseline
+    // went to the outer repository; the turn would be filed against the new
+    // one, as a whole-tree first entry, with herdr told `#1` for a turn that
+    // happened somewhere else.
+    let ground = Ground::new();
+    let outer = ground.repo("outer");
+    let sub = outer.join("sub");
+    std::fs::create_dir_all(&sub).unwrap();
+    std::fs::write(sub.join("work.rs"), "fn main() {}\n").unwrap();
+    git(&outer, &["add", "-A"]);
+    git(&outer, &["commit", "--quiet", "-m", "with a subdirectory"]);
+
+    let herdr = Herdr::default();
+    herdr
+        .pane("w1:p1", "claude", &sub, Status::Idle)
+        .processes("w1:p1", vec![agent_running(&[4_200])])
+        .screen("w1:p1", "❯ set this directory up\n");
+
+    let inner = sub.clone();
+    let steps = vec![
+        status("w1:p1", "claude", &sub, "working", 10),
+        edit(sub.join("work.rs"), "fn main() { /* the real work */ }\n"),
+        // Herdr stops reporting a directory for the pane. Not a move — that is
+        // silence, which the detector is right to ignore — but it does expire
+        // the recorder's cached answer for that path.
+        tweak(&herdr, |h| h.forget_cwd("w1:p1")),
+        Step::Rest(RECONCILE_MS * 3),
+        // The agent makes its working directory a repository of its own.
+        Step::Do(Box::new(move || git(&inner, &["init", "--quiet", "-b", "main"]))),
+        status("w1:p1", "claude", &sub, "idle", 11),
+        Step::Rest(SETTLE_MS * 3),
+    ];
+    let recorder =
+        run_reconciling(&herdr, &ground.state, Duration::from_millis(RECONCILE_MS), steps);
+
+    assert_ne!(
+        Worktree::discover(&sub).unwrap().id,
+        Worktree::discover(&outer).unwrap().id,
+        "the fixture must actually have produced a second worktree at the same path"
+    );
+    assert!(
+        ground.turns(&sub, "claude").is_empty(),
+        "no turn may be filed against a worktree that appeared under the agent mid-turn: {:?}",
+        ground.turns(&sub, "claude")
+    );
+    assert!(
+        ground.recorded(&outer, "claude").is_empty(),
+        "and a turn we can no longer vouch for is abandoned, not guessed at"
+    );
+    assert!(
+        ground.baseline(&outer, "claude").is_some(),
+        "the baseline still went where the turn began — that is the discrepancy that must never pass"
+    );
+    assert_eq!(recorder.recorded(), 0);
+    assert!(herdr.reported().is_empty(), "and herdr is not told a turn number");
 }
 
 #[test]

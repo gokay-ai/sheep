@@ -5,7 +5,7 @@
 //! without a toolchain on the user's machine, and a corrupted tail costs one
 //! line instead of a database.
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::io::Write;
@@ -199,7 +199,25 @@ impl Store {
         Ok(lines)
     }
 
+    /// Add one turn to the end of the log.
+    ///
+    /// Callers hold the worktree lock (see [`crate::lock`]), which is what
+    /// makes "read the last sequence number, then write the turn that claims
+    /// it" one step. The check here is the second answer: a sequence number
+    /// that is not past the end means somebody else minted it in between, and
+    /// two rows numbered `#7` is a `sheep restore #7` that restores whichever
+    /// of them `find` happens to reach first. Refusing is a turn that says it
+    /// was not recorded; appending is a turn number that means two things.
     pub fn append(&self, turn: &Turn) -> Result<()> {
+        if let Some(last) = self.last()? {
+            if turn.seq <= last.seq {
+                bail!(
+                    "refusing to record turn #{} on a timeline that is already at #{}: another Sheep process recorded in between. Nothing was written to the log.",
+                    turn.seq,
+                    last.seq
+                );
+            }
+        }
         let mut line = serde_json::to_string(turn)?;
         line.push('\n');
         let mut file = std::fs::OpenOptions::new()

@@ -7,6 +7,7 @@
 
 pub mod git;
 pub mod herdr;
+pub mod lock;
 pub mod ops;
 pub mod repo;
 pub mod shadow;
