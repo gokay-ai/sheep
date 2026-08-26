@@ -14,7 +14,7 @@ Sheep is what you reach for when one of them wanders off.
 Not the whole flock rounded up, and not the field burned down and reseeded — that one animal, walked
 back to where it was, while the rest carry on grazing.
 
-An agent rewrites nine files in one turn and gets three of them wrong. `git checkout .` is the burnt
+An agent rewrites ten files in one turn and gets three of them wrong. `git checkout .` is the burnt
 field: it takes the last four good turns along with the bad one, and it cannot tell the agent
 anything. Sheep puts **that** worktree back to a turn you pick, leaves every other agent exactly
 where it was, and then tells the agent what was taken back — so it re-reads the files instead of
@@ -63,8 +63,8 @@ It does, it is good, and if you run one agent in one session on one checkout, us
 parts than this. Sheep is for the setup where that stops being enough.
 
 - **It is cross-harness.** Sheep reads herdr's per-pane agent status, not one vendor's transcript
-  format, so `claude`, `codex`, `opencode`, `grok` and anything else herdr attributes an agent to are
-  recorded identically — one timeline per agent per checkout.
+  format, so `claude`, `codex`, `opencode`, `gemini`, `grok` — everything in herdr's detection table —
+  is recorded identically, one timeline per agent per checkout.
 - **It outlives the session.** `/rewind` lives inside one conversation in one CLI and goes when that
   goes. A Sheep timeline is an append-only NDJSON log plus a bare git repository in your state
   directory: `sheep log` reads it tomorrow, with no agent running and no conversation left alive.
@@ -88,14 +88,28 @@ believe it for ten seconds, because herdr infers status from what a pane paints 
 agent `done` in the middle of a turn.
 
 That is not a hypothetical, and the ten seconds is measured rather than guessed. Here is a recorder
-started against a live eight-pane herdr session, thirty-eight seconds in:
+attached to a live ten-pane herdr session, two minutes in — a session with a false `done` in it
+thirty-six seconds after start-up (home paths shortened):
 
-@@WATCH_LOG@@
+```console
+$ tail -f ~/.local/state/herdr/plugins/sheep/logs/watch.log
+2026-08-26 07:39:49Z info watching: settle 10.0s, patience 120s, timelines by Pane, log …/logs/watch.log
+2026-08-26 07:39:51Z info w3K:p1: baseline #1 on w3K:p1 — 60 file(s) in ~/…/herdr-max
+2026-08-26 07:39:51Z info w3K:p0: baseline #1 on w3K:p0 — 60 file(s) in ~/…/herdr-max-projectdocs
+2026-08-26 07:39:51Z info w3K:pZ: baseline #1 on w3K:pZ — 60 file(s) in ~/…/herdr-max-readme
+2026-08-26 07:40:27Z info w3K:p1: withdrawn — the pane went back to working — false done
+2026-08-26 07:41:33Z info w20:p3N: nothing changed on w20:p3N; not recorded
+```
 
-An agent that answered a question without editing anything does not get a row. Neither does a
-candidate that goes back to `working`, or to `blocked`, or whose pane changed directory while the
-turn was in flight — each of those withdraws the boundary and the log names which one it was. A pane
-whose process group is still starting things does not lose its turn; it just waits longer.
+The first thing it does with a pane is take a baseline, because the state *before* an agent's first
+turn is the one you most want back and no boundary announces it. The last two lines are the two ways
+a turn does not get written: herdr said `done`, the recorder waited, and the pane went back to
+`working`; and an agent that answered a question without editing anything.
+
+`blocked` withdraws a candidate too — an agent waiting on you has not finished a turn — and so does a
+pane that changed directory while the turn was in flight, because the tree that would be snapshotted
+is no longer the tree the agent worked in. Each refusal names itself in the log. A pane whose process
+group is still starting things does not lose its turn; it just waits longer.
 
 ### It shows you the plan before it writes anything
 
@@ -210,9 +224,11 @@ opposite behaviour for a case that looks identical — both are tested. →
 **Any path not in the plan.** A three-file restore rewrites three files. →
 `a_restore_touches_only_the_paths_in_its_plan`
 
-**Your line endings.** Snapshots and restores are byte-verbatim: Sheep pins `core.autocrlf=false` for
-its own invocations, so a machine-wide gitconfig cannot normalise your files on the way in or out. A
-`.gitattributes` inside your repository is still honoured. →
+**Your line endings.** Snapshots and restores are byte-verbatim. Sheep pins `core.autocrlf=false`,
+`core.eol=lf` and `core.safecrlf=false` through `GIT_CONFIG_KEY_n`, which outranks every config file,
+so a machine-wide `autocrlf = input` cannot quietly normalise a CRLF file on the way in and write it
+back as LF. A `.gitattributes` inside *your* repository is still honoured, because a repository that
+pins its own endings should round-trip the way its own `git checkout` would. →
 `line_endings_survive_a_hostile_global_gitconfig`
 
 **A repository nested inside your worktree.** `git add -A` records one as a single gitlink — a commit
