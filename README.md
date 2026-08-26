@@ -337,12 +337,16 @@ does not cost anything worth noticing:
 snapshot in either direction. The second is 12,000 generated files of 120–260 lines each, five turns,
 twelve files changed per turn.</sup>
 
-Time, measured on this machine with `SHEEP_STATE_DIR` pointed at a scratch directory each run:
+Time, with `SHEEP_STATE_DIR` pointed at a scratch directory each run:
 
 | | snapshot | plan (`sheep diff`) | restore |
 |---|---|---|---|
 | this repository — 61 tracked files | 0.11 s | 0.08 s | 0.27 s |
 | that synthetic 12,000-file checkout | 1.5 s | 1.5 s | 5.9 s |
+
+<sup>Fastest of ten runs each on an idle machine, which is the number worth quoting because it is the
+one that does not depend on what else you are doing. It does depend on that: re-measured with six
+agents working in other panes, every figure in the top row roughly doubled.</sup>
 
 A snapshot re-stages the whole tree into a fresh index, so the *time* tracks the size of the checkout
 and not the size of the change; what gets *stored* tracks the change, because everything your
