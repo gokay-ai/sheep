@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Report a vulnerability privately
+    url: https://github.com/gokay-ai/sheep/security/advisories/new
+    about: Anything that could destroy or expose someone's work. Not the issue tracker.
+  - name: Known limitations
+    url: https://github.com/gokay-ai/sheep/blob/main/docs/known-limitations.md
+    about: Found deliberately and left on purpose. Check here before filing.
