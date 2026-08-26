@@ -8,8 +8,8 @@ This file is the canonical instructions for anything working in this repository,
 `CLAUDE.md` is a pointer to it and holds nothing of its own, so the two cannot drift.
 
 **Read this before you touch `src/`.** Sheep overwrites files on other people's machines. One
-credible "sheep ate my uncommitted work" report ends the project, so a good deal of this codebase
-is not free to change, and the parts that are not are marked below.
+credible "sheep ate my uncommitted work" report ends the project, so parts of this codebase are
+not free to change. Those parts are marked below.
 
 ---
 
@@ -23,11 +23,11 @@ cargo fmt --check                                       # rustfmt.toml pins the 
 shellcheck herdr-plugin/install.sh herdr-plugin/scripts/*.sh
 ```
 
-All four are CI gates ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)). Run at least
-`cargo test` and `cargo clippy --all-targets -- -D warnings` before you claim a change works;
-`-D warnings` fires on different code per platform, which is why CI runs both legs.
+Everything but `cargo build` is a CI gate ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)).
+Run at least `cargo test` and `cargo clippy --all-targets -- -D warnings` before you claim a change
+works; `-D warnings` fires on different code per platform, which is why CI runs both legs.
 
-Rust 1.85, edition 2021, no `unsafe`, no build script. There is nothing to install beyond a
+Rust 1.85 or newer, edition 2021, no `unsafe`, no build script. There is nothing to install beyond a
 toolchain and `git` on `PATH`.
 
 The plugin half has its own two scripts, run by CI and runnable by hand:
@@ -138,7 +138,7 @@ sheep ui [--rewind]         # the dock, or the plan-and-restore overlay
 sheep ui --snapshot 92x18   # one frame as plain text — reviewable in a PR, assertable in CI
 ```
 
-Quote `#3`: an unquoted `#` starts a comment in every shell this runs in.
+Quote `#3`: in a script an unquoted `#` starts a comment and the argument disappears.
 
 ---
 
@@ -169,7 +169,8 @@ Quote `#3`: an unquoted `#` starts a comment in every shell this runs in.
 
 ## Traps that have already cost someone a day
 
-Every row is a bug that shipped or nearly shipped. The commit message explains it in full.
+Every row is something that shipped broken, nearly shipped broken, or cost a day to find out
+about. The commit named at the end explains it in full.
 
 | trap | where | commit |
 |---|---|---|
