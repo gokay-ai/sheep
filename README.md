@@ -52,8 +52,10 @@ j/k move · enter rewind · ? keys · q quit · n notify · r refresh
 
 <sup>`sheep ui --snapshot 92x18`. Every frame here is real output: `--snapshot` draws one frame of the
 interface into an off-screen buffer and prints it as text, so what you are looking at is reviewable
-in a pull request and assertable in CI. These five turns were recorded by hand with `sheep snap`,
-which is why they read `manual` — the recorder labels its own `turn`.</sup>
+in a pull request and assertable in CI —
+[`docs/readme/make-frames.sh`](docs/readme/make-frames.sh) builds the fixture and takes both
+photographs. These five turns were recorded by hand with `sheep snap`, which is why they read
+`manual`; the recorder labels its own `turn`.</sup>
 
 ## "Claude Code already has `/rewind`"
 
@@ -135,7 +137,7 @@ timeline claude · 5 turns · newest 1m ago · notify on
 ╰──────────────────────────────────────────────────────── dry run — nothing is written yet ╯
 ```
 
-<sup>`sheep ui --rewind --select 4 --keys d --snapshot 92x30`.</sup>
+<sup>`sheep ui --rewind --select 4 --keys d --snapshot 92x30`, same fixture.</sup>
 
 The same plan on the command line, which touches nothing either:
 
