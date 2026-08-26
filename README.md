@@ -345,9 +345,10 @@ Time, with `SHEEP_STATE_DIR` pointed at a scratch directory each run:
 | this repository — 61 tracked files | 0.11 s | 0.08 s | 0.27 s |
 | that synthetic 12,000-file checkout | 1.5 s | 1.5 s | 5.9 s |
 
-<sup>Fastest of ten runs each on an idle machine, which is the number worth quoting because it is the
-one that does not depend on what else you are doing. It does depend on that: re-measured with six
-agents working in other panes, every figure in the top row roughly doubled.</sup>
+<sup>Fastest of ten runs each on an idle machine — the number worth quoting, because it is the one
+that does not depend on what else you happen to be doing. It does depend on that: re-measured with
+the machine busy (several agents working in other panes) every figure in the top row roughly
+doubled.</sup>
 
 A snapshot re-stages the whole tree into a fresh index, so the *time* tracks the size of the checkout
 and not the size of the change; what gets *stored* tracks the change, because everything your
