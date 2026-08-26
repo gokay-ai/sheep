@@ -179,8 +179,9 @@ The message that lands in the agent's pane after a restore:
 > before you edit it, and do not re-apply the reverted changes unless you are asked to. The state
 > from just before the rewind was kept as turn #6; `sheep restore #6 --yes` puts it back.
 
-The timeline it left behind says the same thing twice — once as the checkpoint that makes the rewind
-reversible, once as the turn that records where you landed:
+And the timeline it left behind: the checkpoint that makes the rewind reversible, and above it the
+turn that records where you landed, so the log describes what is on disk rather than what you asked
+for.
 
 ```console
 $ sheep log
@@ -281,14 +282,21 @@ involved. Content your repository already holds costs nothing to store; only wha
 your last commit is written, and only once.
 
 **Turn detection at corroborated status edges.** A candidate opens only on `working` → at-rest, and
-only for a pane that has actually been seen working since its last recorded turn. It has to survive a
-quiet window with no status change and no new output — herdr's per-pane revision counter is what "no
-new output" means, and a still-working agent paints. Going back to `working`, `blocked` or `unknown`
-withdraws it. So does moving directory: a turn is bound to the directory it *started* in, fixed on
-the edge into `working`, because a `cd` that arrives mid-turn is otherwise absorbed by every later
-check. When the window elapses the recorder corroborates twice before writing — it re-asks herdr for
-the pane, and it asks the kernel. If the pids in the pane's foreground process group changed, that is
-an agent running tools rather than an agent that has stopped, and the window is extended.
+only for a pane that has been seen working since its last recorded turn; a pane that merely appears
+at rest never produces anything. "No new output" means herdr's per-pane revision counter, which bumps
+on every paint — and a still-working agent paints.
+
+The subtle one is the directory. A turn is bound to the directory it *started* in, fixed on the edge
+into `working`, because reading it when the boundary opens is already too late: a mid-turn `cd` has
+been absorbed by then, and every later check compares the new directory against itself and agrees.
+
+When the quiet window elapses the recorder corroborates twice before anything is written. It re-asks
+herdr for the pane, which closes the case where the event that would have withdrawn the candidate
+went missing across a reconnect. Then it asks the kernel: if the pids in the pane's foreground process
+group changed, that is an agent running tools rather than an agent that has stopped, and the window
+is extended. The state machine itself is pure — sightings and an explicit clock in, signals out —
+which is why the whole thing is tested against synthetic event sequences with no server and no
+sleeping.
 
 **The write-back.** A restore driven from the overlay finishes by sending that pane's agent a message
 over herdr's `agent.prompt`: the turn number, the file counts, the instruction to re-read, and the
@@ -410,7 +418,10 @@ Other environment: `SHEEP_STATE_DIR` overrides where state lives, with precedenc
 `HERDR_PLUGIN_STATE_DIR` > `SHEEP_STATE_DIR` > `XDG_STATE_HOME` > `~/.local/state/sheep`. Set it when
 you are experimenting so nothing lands in the real one. `SHEEP_LINE` does the same for `--line`, and
 is how a dock pane learns whose timeline it is showing — a pane's argv is fixed by the manifest, so
-the environment is the only thing that can tell two docks apart.
+the environment is the only thing that can tell two docks apart. If the dock and the recorder ever
+named a timeline differently the dock would read one nothing writes and report an empty history,
+which is indistinguishable from the truth; `tests/plugin_timeline.rs` runs both halves and compares
+the strings, and the dock's empty state names the other timelines it can see for the worktree.
 
 ### Building it yourself
 
