@@ -407,6 +407,9 @@ note       gitignored files present: Sheep never captures or overwrites them.
 status     ready
 ```
 
+<sup>A scratch checkout with a vendored repository and an ignored `.env` in it; the two long temporary
+paths are elided.</sup>
+
 A **timeline** (`--line`) is one recording stream. `sheep watch` names one per agent per worktree by
 default, so `claude` and `codex` in the same checkout do not share a history; `--line-by pane` gives
 you one per pane instead, at the cost of starting fresh every time herdr restarts.
