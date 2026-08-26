@@ -20,3 +20,9 @@ LICENSE text eol=lf
 # here so the first one does not have to rediscover it.
 *.bat text eol=crlf
 *.cmd text eol=crlf
+
+# Photographs. `text=auto` above would guess; these must not take a line ending.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary

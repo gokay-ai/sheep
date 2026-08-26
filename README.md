@@ -9,11 +9,15 @@
 </p>
 
 <p align="center">
-  <img src="docs/readme/hero.jpg" alt="A sheep at a desk of red diffs, hoof on the undo button" width="800">
+  <img src="docs/readme/hero.jpg" alt="A sheep at a time-rewind machine, an agent in the wreckage behind it" width="800">
 </p>
 
 [herdr](https://herdr.dev) runs coding agents in panes, a git worktree each. Sheep records every
 turn as a checkpoint, rewinds **that** worktree, and tells the agent what was taken back.
+
+<p align="center">
+  <img src="docs/readme/restore.jpg" alt="A sheep inspects a catastrophic commit while another hits rewind" width="800">
+</p>
 
 Linux and macOS.
 
