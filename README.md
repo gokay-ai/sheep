@@ -31,19 +31,19 @@ with no herdr at all; the plugin is what makes it automatic.
 
 ```text
  sheep  sheep                                                                          ready
-timeline claude · 5 turns · newest 43s ago · notify on
+timeline claude · 5 turns · newest just now · notify on
 ╭ timeline ────────────────────────────────────────────────────────────────────────────────╮
-│▌#5   manual     claude                                                 90f73711 · 43s ago│
+│▌#5   manual     claude                                                b22d9624 · just now│
 │▌  10 files   +10 −75   ████████████                                                      │
 │▌  extract the retry helper and use it everywhere                                         │
-│▌  90f73711129f · 2026-08-26 07:42 UTC                                                    │
-│ #4   manual     claude                                                  f944f1ef · 1m ago│
+│▌  b22d96246056 · 2026-08-26 08:24 UTC                                                    │
+│ #4   manual     claude                                                  ca196040 · 1m ago│
 │   1 file   +1 −1   █                                                                     │
 │   lower the reconnect ceiling to 20s                                                     │
-│ #3   manual     claude                                                  f0154c28 · 3m ago│
+│ #3   manual     claude                                                  82aaad15 · 2m ago│
 │   2 files   +3 −0   █                                                                    │
 │   add a theme helper                                                                     │
-│ #2   manual     claude                                                  19540f92 · 5m ago│
+│ #2   manual     claude                                                  2c937eb2 · 4m ago│
 │   1 file   +2 −0   █                                                                     │
 │   cap the note length                                                                    │
 ╰───────────────────────────────────────────────────────────────────────────────────── 1/5 ╯
@@ -141,9 +141,9 @@ lower-case `r` is refresh, and a plan nobody has looked at cannot be applied.
 
 ```text
  sheep  sheep                                                                          ready
-timeline claude · 5 turns · newest 1m ago · notify on
+timeline claude · 5 turns · newest just now · notify on
 ╭ rewind to #4 ────────────────────────────────────────────────────────────────────────────╮
-│back to #4  2m ago · claude · manual                                          f944f1ef431a│
+│back to #4  1m ago · claude · manual                                          ca1960401629│
 │lower the reconnect ceiling to 20s                                                        │
 │10 paths change  —  10 written · 0 removed                                                │
 │──────────────────────────────────────────────────────────────────────────────────────────│
@@ -178,7 +178,7 @@ The same plan on the command line, which touches nothing either:
 
 ```console
 $ sheep diff --line claude '#4'
-restore to f944f1ef431a  ·  10 file(s) written, 0 removed
+restore to ca1960401629  ·  10 file(s) written, 0 removed
   write   src/git.rs
   write   src/herdr/detect.rs
   write   src/ops.rs
@@ -195,7 +195,7 @@ restore to f944f1ef431a  ·  10 file(s) written, 0 removed
 
 The message that lands in the agent's pane after a restore:
 
-> `[sheep]` Your working tree was rewound to turn #4 (f944f1ef431a). 10 path(s) changed on disk: 10
+> `[sheep]` Your working tree was rewound to turn #4 (ca1960401629). 10 path(s) changed on disk: 10
 > rewritten, 0 deleted. Anything you wrote after turn #4 is no longer on disk — re-read any file
 > before you edit it, and do not re-apply the reverted changes unless you are asked to. The state
 > from just before the rewind was kept as turn #6; `sheep restore #6 --yes` puts it back.
@@ -206,13 +206,13 @@ for.
 
 ```console
 $ sheep log --line claude
-#7    9ba4396fb2cf  manual       10 files  +75     -10     restored to f944f1ef431a
-#6    9766acafdf0d  checkpoint    0 files  +0      -0      before restore to f944f1ef431a
-#5    90f73711129f  manual       10 files  +10     -75     extract the retry helper and use it everywhere
-#4    f944f1ef431a  manual        1 files  +1      -1      lower the reconnect ceiling to 20s
-#3    f0154c288942  manual        2 files  +3      -0      add a theme helper
-#2    19540f92756b  manual        1 files  +2      -0      cap the note length
-#1    2f0e1798bda6  manual       60 files  +0      -0      start of session
+#7    28d02b047fa1  manual       10 files  +75     -10     restored to ca1960401629
+#6    a45477c3473a  checkpoint    0 files  +0      -0      before restore to ca1960401629
+#5    b22d96246056  manual       10 files  +10     -75     extract the retry helper and use it everywhere
+#4    ca1960401629  manual        1 files  +1      -1      lower the reconnect ceiling to 20s
+#3    82aaad15e20c  manual        2 files  +3      -0      add a theme helper
+#2    2c937eb2df11  manual        1 files  +2      -0      cap the note length
+#1    b362bf80e300  manual       61 files  +0      -0      start of session
 ```
 
 Outside herdr the message is a no-op by construction rather than by a branch, so the interface
