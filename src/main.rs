@@ -52,7 +52,9 @@ enum Command {
     Diff { target: String },
     /// Restore the working tree to a turn. Dry run unless --yes is given.
     Restore {
+        /// Turn to restore, as `#3` or a commit id.
         target: String,
+        /// Apply the restore. Without this, only the plan is printed.
         #[arg(long)]
         yes: bool,
     },

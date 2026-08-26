@@ -230,10 +230,14 @@ pub struct RestoreFailed {
 impl std::fmt::Display for RestoreFailed {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "the restore failed: {}", self.cause)?;
+        // Causes are full sentences and already end in a period. Adding
+        // another produced "if that is what you want.. Your files were put
+        // back" — the doubled stop a stranger sees on the restore screen.
+        let stop = if self.cause.ends_with('.') { "" } else { "." };
         if self.recovered {
-            return write!(f, ". Your files were put back as they were.");
+            return write!(f, "{stop} Your files were put back as they were.");
         }
-        write!(f, ". Your working tree is between two states")?;
+        write!(f, "{stop} Your working tree is between two states")?;
         if let Some(err) = &self.recovery_error {
             write!(f, ", and putting it back failed too ({err})")?;
         }
