@@ -87,10 +87,13 @@ pane leaves `working` for `idle`/`done` it opens a *candidate* boundary — and 
 believe it for ten seconds, because herdr infers status from what a pane paints and will call an
 agent `done` in the middle of a turn.
 
-That is not a hypothetical, and the ten seconds is measured rather than guessed. It says what it did
-in a log file rather than in the pane you are using. Thirteen minutes of one, from a live herdr
-session with ten agent panes in it — started with `--line-by pane`, so the timelines are named after
-panes rather than after agents, and with home paths shortened:
+Ten seconds is measured rather than guessed, and `sheep watch --help` says where the number came
+from: a live herdr 0.8.0 session was watched flipping a pane to `done` and back to `working` 9.2
+seconds later, with the agent still mid-turn. Anything shorter records that as a turn.
+
+The recorder says what it did in a log file rather than in the pane you are using. Here are thirteen
+minutes of one, from a live session with ten agent panes in it. It was started with `--line-by pane`,
+so the timelines are named after panes rather than after agents, and home paths are shortened:
 
 ```console
 $ tail -f ~/.local/state/herdr/plugins/sheep/logs/watch.log
