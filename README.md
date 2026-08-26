@@ -467,12 +467,21 @@ cargo test                   # 218 tests
 cargo clippy --all-targets -- -D warnings && cargo fmt --check
 ```
 
-CI runs fmt, clippy and the tests on Linux and macOS — the two platforms Sheep claims — plus
-shellcheck, an installer round trip that asserts `install.sh` and the release matrix ask for exactly
-the same asset names, and eight concurrent `watchd start`s that have to leave exactly one recorder
-running. Releases cover five targets under one `SHA256SUMS`: four built natively, and
-`x86_64-apple-darwin` cross-compiled on the arm64 macOS runner, which is the only cross-compilation
-in the matrix.
+CI runs fmt, clippy and the tests on both Linux and macOS — the two platforms Sheep claims. On Linux
+only, it also runs shellcheck, an installer round trip that asserts `install.sh` and the release
+matrix ask for exactly the same asset names, and eight concurrent `watchd start`s that have to leave
+exactly one recorder running. Nothing gates `herdr-plugin/scripts/*.sh` on macOS, so if you change
+them, run them on a Mac yourself: `ps` and `pgrep` are exactly where BSD and GNU differ, and the
+recorder daemon is built out of both. Releases cover five targets under one `SHA256SUMS`: four built
+natively, and `x86_64-apple-darwin` cross-compiled on the arm64 macOS runner, which is the only
+cross-compilation in the matrix.
+
+[`AGENTS.md`](AGENTS.md) is the canonical guide for anyone working in the repository, human or
+agent: the eight invariants with the test behind each, and a table of the traps that have already
+cost someone a day. [`CONTRIBUTING.md`](CONTRIBUTING.md) is the bar in full, and it is one
+sentence long — a change that can write to a user's files needs a test that fails without it, and
+you say in the pull request that you watched it fail. Anything that could cost somebody data goes
+to [`SECURITY.md`](SECURITY.md) rather than the issue tracker.
 
 ## What Sheep does not do
 
