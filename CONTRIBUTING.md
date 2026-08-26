@@ -27,13 +27,18 @@ cargo fmt --check
 shellcheck herdr-plugin/install.sh herdr-plugin/scripts/*.sh
 ```
 
-CI runs all four, plus the two plugin scripts, on Linux and macOS
-([`.github/workflows/ci.yml`](.github/workflows/ci.yml)):
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) has two jobs, and it is worth knowing which
+is which. `fmt`, `clippy` and `test` run on **Linux and macOS** both. `shellcheck` and the two
+plugin scripts are a single **Linux-only** job:
 
 ```bash
 bash herdr-plugin/scripts/test-install.sh    # the installer and the release matrix agree on every asset name
 bash herdr-plugin/scripts/test-watchd.sh     # exactly one recorder survives eight concurrent starts
 ```
+
+So nothing gates `herdr-plugin/scripts/*.sh` on macOS. If you change them, run them on a Mac
+yourself — `ps` and `pgrep` are exactly where BSD and GNU differ, and the recorder daemon is built
+out of both.
 
 `test-watchd.sh` builds its own plugin root and stand-in recorder and matches only on that path,
 so a real `sheep watch` on your machine is neither counted nor killed by it.
@@ -41,6 +46,12 @@ so a real `sheep watch` on your machine is neither counted nor killed by it.
 Most of the suite needs nothing but `git`. The recorder and the interface are tested against a
 scripted herdr and `ratatui`'s `TestBackend`, so no pseudo-terminal and no herdr session is
 involved anywhere in CI.
+
+One exception, and it will bite you rather than CI: `wire::live_session_answers_ping` no-ops unless
+`wire::inside_herdr()`, so when you run `cargo test` **from inside a herdr pane** it pings your real
+herdr server. On a loaded machine that server sometimes hangs up without replying, and the test
+fails on something that is not your change. If you see only that one red, re-run, or
+`cargo test -- --skip live_session_answers_ping`.
 
 ## Trying your change by hand
 

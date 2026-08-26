@@ -18,4 +18,6 @@
 - [ ] `cargo clippy --all-targets -- -D warnings`
 - [ ] `cargo fmt --check`
 - [ ] `shellcheck herdr-plugin/install.sh herdr-plugin/scripts/*.sh` — if the plugin half changed
-- [ ] Ran on Linux / macOS (say which; CI covers both)
+- [ ] Ran on Linux / macOS (say which). CI runs the Rust checks on both; `shellcheck` and the
+      plugin scripts are a Linux-only job, so a change to `herdr-plugin/scripts/*.sh` is gated
+      on nothing but you on macOS.

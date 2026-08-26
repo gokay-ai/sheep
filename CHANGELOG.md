@@ -58,12 +58,20 @@ Nothing has been tagged yet. This is what `v0.1.0` will contain.
 
 ### Safety
 
-The eight invariants in [`AGENTS.md`](AGENTS.md), each with a test written from the attacker's side
-in [`tests/adversarial.rs`](tests/adversarial.rs). Sheep never writes into your `.git`, never runs a
-repository hook, never captures or overwrites a gitignored file, never touches a path outside the
+The eight invariants in [`AGENTS.md`](AGENTS.md). Each has a test written from the attacker's side in
+[`tests/adversarial.rs`](tests/adversarial.rs) except the second, which cannot have one and does not
+need one: it holds by construction, because `src/git.rs` is the only place in the program that
+spawns `git` and it only ever spawns plumbing.
+
+Sheep never writes into your `.git`, never runs a repository hook, never touches a path outside the
 plan it showed you, refuses to delete a repository nested in your worktree, verifies every object
 before it reads it, checkpoints your tree before it changes a byte, and puts the tree back if a
 restore fails partway.
+
+An **untracked** file your `.gitignore` matches is never captured and therefore never overwritten —
+that is what keeps `.env` and `node_modules/` safe. A file git *tracks* is captured at every turn
+even when an ignore rule also matches it, and its contents then sit in the state directory in the
+clear. The two cases look alike and behave oppositely, which is why they are stated apart.
 
 Known limits, all found deliberately and left on purpose, are in
 [`docs/known-limitations.md`](docs/known-limitations.md).

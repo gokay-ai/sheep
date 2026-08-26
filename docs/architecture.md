@@ -106,8 +106,10 @@ git update-ref refs/sheep/<line>    compare-and-swap
 append one line to <timeline>.ndjson
 ```
 
-The index is a scratch file, never the user's. `-A` honours `.gitignore`, which is the whole of
-invariant 8: ignored files are never captured, and therefore never restored over.
+The index is a scratch file, never the user's. `-A` honours `.gitignore`, which is half of
+invariant 8: an *untracked* ignored file is never captured, and therefore never restored over.
+The other half is the paragraph below — a file git tracks is captured whatever an ignore rule
+says about it.
 
 The second `add` is the subtle one. A scratch index starts *empty*, so every path in it looks
 untracked — and git applies ignore rules only to untracked paths. Real git never hits this because
@@ -333,6 +335,13 @@ the dock reads a timeline nothing writes and says "nothing recorded yet", which 
 from the truth — the most damaging sentence this plugin can print.
 [`tests/plugin_timeline.rs`](../tests/plugin_timeline.rs) therefore runs both halves for real, in a
 shell and through clap, and compares the strings and the turn-log paths they open (`25f825a`).
+
+The second half of that fix is the one a user actually sees: an empty dock calls `Store::lines_for`
+([`src/store.rs:183`](../src/store.rs#L183)) and names the other timelines recorded for this
+worktree, so "nothing here" can never again read the same as "you are in the wrong place". The
+comparison is in slugs, so the timeline you are already on is not offered as somewhere else to look
+— `tui_flow::a_load_reports_the_other_timelines_recorded_for_this_worktree` asserts both, and
+`tui_render::an_empty_timeline_names_the_ones_that_are_not` asserts it reaches the screen.
 
 The prompt beside a turn is screen-scraped, because no API tells a plugin what a user typed. The
 rule is deliberately narrow — the last visible line starting with a prompt marker and carrying real
