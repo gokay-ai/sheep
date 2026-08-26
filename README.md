@@ -259,8 +259,10 @@ of it back. Sheep refuses before touching anything:
 $ sheep restore '#1' --yes
 restore to 9e11dca6131e  ·  0 file(s) written, 1 removed
   remove  vendor/parser
-sheep: the restore failed: refusing to restore: `vendor/parser` is a directory whose contents Sheep never captured.
-A git repository inside your worktree is recorded only as a pointer, so removing it here would delete files no snapshot holds — including anything ignored inside it. Move or delete it yourself if that is what you want.. Your files were put back as they were.
+sheep: the restore failed: refusing to restore: `vendor/parser` is a directory whose contents
+Sheep never captured. A git repository inside your worktree is recorded only as a pointer, so
+removing it here would delete files no snapshot holds — including anything ignored inside it.
+Move or delete it yourself if that is what you want.. Your files were put back as they were.
 ```
 
 → `a_nested_repository_is_never_deleted_by_a_restore`, `a_nested_repository_is_not_clobbered_by_a_write_either`
