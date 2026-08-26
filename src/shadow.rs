@@ -225,16 +225,19 @@ impl Shadow {
             String::from_utf8_lossy(&tracked.stdout)
                 .split('\0')
                 .filter(|rel| !rel.is_empty())
-                // Still a file, specifically. `ls-files` names files, so a path
-                // that is now a directory means the tracked file is gone — the
-                // sweep above already recorded that — and force-adding the
-                // directory instead would drag every ignored thing beneath it
-                // into the snapshot, which is invariant 8 broken from the
-                // inside.
-                .filter(|rel| {
-                    std::fs::symlink_metadata(self.worktree.root.join(rel))
-                        .is_ok_and(|m| !m.is_dir())
-                })
+                // Still a file, specifically, and not behind a symlink.
+                // `ls-files` names files, so a path that is now a directory
+                // means the tracked file is gone — the sweep above already
+                // recorded that — and force-adding the directory instead
+                // would drag every ignored thing beneath it into the
+                // snapshot, which is invariant 8 broken from the inside.
+                //
+                // Intermediate symlinks are a different trap: `symlink_metadata`
+                // follows them and reports the target as a file, so the path
+                // survived the old filter, and `add --pathspec-from-file`
+                // then rejected the *whole batch* with "beyond a symbolic
+                // link". One such path stopped every snapshot on the worktree.
+                .filter(|rel| tracked_path_is_force_addable(&self.worktree.root, rel))
                 .flat_map(|rel| rel.bytes().chain(std::iter::once(0)))
                 .collect()
         } else {
@@ -734,6 +737,37 @@ impl Shadow {
         }
         Ok((files, adds, dels))
     }
+}
+
+/// Whether a path from the user's `ls-files` is safe to force-add onto an
+/// empty scratch index.
+///
+/// Two refusals, both for the same reason: git's answer to the pathspec is
+/// not "skip this one", it is "abort the batch".
+///
+/// * A path that is now a directory — force-adding it drags every ignored
+///   file beneath it into the snapshot (invariant 8).
+/// * A path whose intermediate component is a symlink — git rejects it as
+///   "beyond a symbolic link". `symlink_metadata` on the full path follows
+///   those intermediates and reports the target as a file, so looking only
+///   at the last component lets the path through.
+fn tracked_path_is_force_addable(root: &Path, rel: &str) -> bool {
+    let mut current = root.to_path_buf();
+    let mut parts = rel.split('/').filter(|p| !p.is_empty()).peekable();
+    while let Some(part) = parts.next() {
+        current.push(part);
+        let Ok(meta) = std::fs::symlink_metadata(&current) else {
+            return false;
+        };
+        if parts.peek().is_some() {
+            if meta.is_symlink() || !meta.is_dir() {
+                return false;
+            }
+        } else {
+            return !meta.is_dir();
+        }
+    }
+    false
 }
 
 /// Files under `dir` that `doomed` does not name, relative to `root`.

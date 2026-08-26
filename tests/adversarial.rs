@@ -1263,6 +1263,199 @@ fn a_nested_repository_is_not_clobbered_by_a_write_either() {
 }
 
 #[test]
+fn doctor_names_a_nested_repository_under_an_untracked_parent() {
+    // `ls-files -o --directory` stops at `vendor/`, so `vendor/parser` — a
+    // repository under an untracked parent — was invisible to doctor. The
+    // restore refusal still fired against the disk; the up-front warning did
+    // not. Depth 4 is the same scan, not a different case.
+    let f = Fixture::new();
+    f.write("a.txt", "one\n");
+    f.commit_all("base");
+    let before = f.snap("before the nested repositories existed");
+
+    let parser = f.repo.join("vendor/parser");
+    fs::create_dir_all(&parser).unwrap();
+    git(&parser, &["init", "--quiet", "-b", "main"]);
+    fs::write(parser.join("inside.txt"), "parser\n").unwrap();
+    git(&parser, &["add", "-A"]);
+    git(&parser, &["commit", "--quiet", "-m", "parser"]);
+
+    let deep = f.repo.join("deep/a/b/repo");
+    fs::create_dir_all(&deep).unwrap();
+    git(&deep, &["init", "--quiet", "-b", "main"]);
+    fs::write(deep.join("inside.txt"), "deep\n").unwrap();
+    git(&deep, &["add", "-A"]);
+    git(&deep, &["commit", "--quiet", "-m", "deep"]);
+
+    f.write(".gitignore", "ignored/\n");
+    let ignored = f.repo.join("ignored/somerepo");
+    fs::create_dir_all(&ignored).unwrap();
+    git(&ignored, &["init", "--quiet", "-b", "main"]);
+    fs::write(ignored.join("secret.txt"), "not ours\n").unwrap();
+    git(&ignored, &["add", "-A"]);
+    git(&ignored, &["commit", "--quiet", "-m", "ignored"]);
+
+    let health = repo::inspect(&f.wt(), BUDGET).unwrap();
+    assert!(
+        health.blockers.is_empty(),
+        "a nested repo with a commit is a warning, not a stop: {:?}",
+        health.blockers
+    );
+    let named: Vec<&str> = health
+        .warnings
+        .iter()
+        .filter_map(|w| match w {
+            Warning::NestedRepositories(paths) => Some(paths.as_slice()),
+            _ => None,
+        })
+        .flatten()
+        .map(String::as_str)
+        .collect();
+    assert!(named.contains(&"vendor/parser"), "depth-2 must be named: {named:?}");
+    assert!(named.contains(&"deep/a/b/repo"), "depth-4 must be named: {named:?}");
+    assert!(
+        !named.iter().any(|p| p.contains("ignored")),
+        "an ignored nested repository is outside Sheep's reach: {named:?}"
+    );
+
+    // Recording still works: a nested repo *with* a commit is a gitlink.
+    f.snap("the nested repositories exist now");
+
+    let err = ops::restore(&f.wt(), &f.state, "default", &before.to_string(), BUDGET)
+        .expect_err("removing a nested repository must still be refused");
+    assert!(
+        err.to_string().contains("vendor/parser") || err.to_string().contains("deep/a/b/repo"),
+        "the refusal should name one of them: {err}"
+    );
+    assert!(parser.join(".git").is_dir(), "history under the untracked parent must survive");
+    assert!(deep.join(".git").is_dir(), "history at depth 4 must survive");
+}
+
+#[test]
+fn a_nested_repository_with_no_commit_checked_out_is_a_refusal() {
+    // `git add -A` fails outright on a nested repo with no HEAD, so snap, diff
+    // and restore all died with a raw git error — after doctor had said
+    // `status ready`. An agent that ran `git init` in a subdirectory and had
+    // not committed yet stopped its own timeline from recording.
+    let f = Fixture::new();
+    f.write("a.txt", "one\n");
+    f.commit_all("base");
+    f.snap("before the unborn nested repository");
+
+    let unborn = f.repo.join("vendor/nocommit");
+    fs::create_dir_all(&unborn).unwrap();
+    git(&unborn, &["init", "--quiet", "-b", "main"]);
+
+    let health = repo::inspect(&f.wt(), BUDGET).unwrap();
+    assert!(
+        matches!(
+            health.blockers.first(),
+            Some(Blocker::NestedRepositoryWithoutCommit(paths)) if paths.iter().any(|p| p == "vendor/nocommit")
+        ),
+        "an unborn nested repository must be a blocker, got {:?}",
+        health.blockers
+    );
+    assert!(!health.is_safe());
+
+    let err =
+        ops::snap(&f.wt(), &f.state, "default", BUDGET, TurnKind::Turn, SnapMeta::default(), false)
+            .expect_err("snapshotting past an unborn nested repository must refuse");
+    let message = err.to_string();
+    assert!(
+        message.contains("no commit checked out"),
+        "the refusal must say what happened: {message}"
+    );
+    assert!(message.contains("vendor/nocommit"), "the refusal must name the repository: {message}");
+    assert!(
+        message.contains("Commit inside it") || message.contains("remove it"),
+        "the refusal must say what to do: {message}"
+    );
+    assert!(
+        !message.contains("failed to stage"),
+        "a raw git staging error is the bug, not the fix: {message}"
+    );
+
+    let plan_err = match ops::plan(&f.wt(), &f.state, "default", "1", BUDGET) {
+        Ok(_) => panic!("planning must refuse the same way"),
+        Err(err) => err,
+    };
+    assert!(
+        plan_err.to_string().contains("no commit checked out"),
+        "diff/restore go through plan: {plan_err}"
+    );
+}
+
+#[test]
+fn a_tracked_file_under_a_symlinked_directory_does_not_kill_the_snapshot() {
+    // Found against a real repository: a tracked file whose parent directory
+    // was replaced with a symlink. `symlink_metadata` on the full path follows
+    // intermediate links and reports a file, so the second staging pass
+    // force-added it, and git rejected the whole batch — "pathspec is beyond a
+    // symbolic link". Doctor said `ready`; not one turn could be recorded.
+    #[cfg(unix)]
+    {
+        let f = Fixture::new();
+        f.write("pkg/a.txt", "original\n");
+        f.write("other.txt", "keep\n");
+        f.commit_all("base");
+        f.snap("pkg is a real directory");
+
+        fs::create_dir_all(f.repo.join("real")).unwrap();
+        fs::rename(f.repo.join("pkg/a.txt"), f.repo.join("real/a.txt")).unwrap();
+        fs::remove_dir(f.repo.join("pkg")).unwrap();
+        std::os::unix::fs::symlink("real", f.repo.join("pkg")).unwrap();
+
+        let health = repo::inspect(&f.wt(), BUDGET).unwrap();
+        assert!(
+            health.blockers.is_empty(),
+            "a symlink parent is not a blocker: {:?}",
+            health.blockers
+        );
+
+        let with_symlink = f.snap("pkg is a symlink now");
+
+        fs::write(f.repo.join("real/a.txt"), "mutated through the symlink\n").unwrap();
+        f.snap("mutated");
+
+        f.restore(with_symlink);
+        assert_eq!(
+            fs::read_to_string(f.repo.join("real/a.txt")).unwrap(),
+            "original\n",
+            "the snapshot taken through the symlink must be the tree on disk"
+        );
+        assert_eq!(f.read("other.txt"), "keep\n");
+    }
+}
+
+#[test]
+fn a_tracked_path_that_became_a_directory_does_not_pull_ignored_files_into_the_snapshot() {
+    // The companion to the symlink filter: force-adding a tracked path that is
+    // now a directory would drag every ignored file beneath it into the
+    // snapshot, which is invariant 8 from the inside.
+    let f = Fixture::new();
+    f.write("thing", "I am a file\n");
+    f.write(".gitignore", "thing/.env\n");
+    f.commit_all("base");
+    let as_file = f.snap("turn 1");
+
+    fs::remove_file(f.repo.join("thing")).unwrap();
+    f.write("thing/inner.txt", "visible\n");
+    f.write("thing/.env", "SECRET=hunter2\n");
+    f.snap("turn 2");
+
+    let planned = ops::plan(&f.wt(), &f.state, "default", &as_file.to_string(), BUDGET).unwrap();
+    assert!(
+        !planned.plan.remove.iter().any(|p| p.contains(".env")),
+        "an ignored file under a path that became a directory must not enter a plan: {:?}",
+        planned.plan
+    );
+    ops::restore(&f.wt(), &f.state, "default", &as_file.to_string(), BUDGET).expect_err(
+        "writing a file over a directory that still holds an ignored file must be refused",
+    );
+    assert_eq!(f.read("thing/.env"), "SECRET=hunter2\n", "the ignored file must survive");
+}
+
+#[test]
 fn a_tracked_file_an_ignore_rule_matches_is_still_captured() {
     // The scratch index starts empty, so every path in it looked untracked, and
     // git applies ignore rules only to untracked paths. Real git never does

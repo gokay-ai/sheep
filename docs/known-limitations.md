@@ -39,11 +39,14 @@ captures nothing inside it, restores nothing inside it, and **refuses** any rest
 remove or overwrite it, because the contents are in no snapshot and the checkpoint could not
 bring them back.
 
-`sheep doctor` names them before you start, but only the ones git lists for it. The scan reads
-`ls-files -o --directory`, which stops at the shallowest untracked directory — so a repository
-under an untracked parent (`vendor/` untracked, `vendor/parser` a repository) is not named. The
-refusal is unaffected: it is decided at the moment of the write, against what is on disk, not
-against what doctor found.
+`sheep doctor` names them before you start, at any depth: the scan reads `ls-files -o` without
+`--directory`, so git descends into untracked parents and emits a trailing slash only at a
+repository boundary. A nested repository with no commit checked out is a refusal, not a note —
+`git add -A` cannot index it, so every snapshot would otherwise die with a raw git error after
+doctor had said `ready`. Commit inside it, or remove it.
+
+The refusal to remove or overwrite one is decided at the moment of the write, against what is
+on disk, not against what doctor found.
 
 ## Ignored files
 

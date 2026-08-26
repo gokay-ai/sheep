@@ -101,6 +101,10 @@ pub enum Blocker {
     OperationInProgress(String),
     /// The worktree holds more tracked files than the budget allows.
     TooLarge { files: usize, limit: usize },
+    /// A git repository inside the worktree with no commit checked out.
+    /// `git add -A` refuses to index it, so every snapshot would die with a
+    /// raw git error after doctor had said `ready`.
+    NestedRepositoryWithoutCommit(Vec<String>),
 }
 
 impl std::fmt::Display for Blocker {
@@ -119,6 +123,20 @@ impl std::fmt::Display for Blocker {
                 f,
                 "{files} tracked files exceeds the {limit}-file budget. Raise it with --max-files if you mean it."
             ),
+            Blocker::NestedRepositoryWithoutCommit(paths) => {
+                let listed = paths.iter().map(|p| format!("`{p}`")).collect::<Vec<_>>().join(", ");
+                if paths.len() == 1 {
+                    write!(
+                        f,
+                        "the nested git repository at {listed} has no commit checked out. Commit inside it, or remove it, before Sheep can record this tree."
+                    )
+                } else {
+                    write!(
+                        f,
+                        "nested git repositories at {listed} have no commit checked out. Commit inside each, or remove them, before Sheep can record this tree."
+                    )
+                }
+            }
         }
     }
 }
@@ -234,17 +252,39 @@ pub fn inspect(wt: &Worktree, max_files: usize) -> Result<Health> {
         health.warnings.push(Warning::IgnoredFilesPresent);
     }
 
-    // An untracked directory that is itself a repository is the case `ls-files
-    // --stage` cannot see: it has no index entry until something commits it,
-    // yet `git add -A` will record it as a gitlink the moment Sheep snapshots.
-    // `--directory` stops git from listing its contents, so this stays cheap.
-    let nested: Vec<String> = git
-        .run_z(&["ls-files", "-o", "--directory", "--exclude-standard", "-z"])?
-        .into_iter()
-        .filter(|entry| entry.ends_with('/'))
-        .filter(|entry| wt.root.join(entry.trim_end_matches('/')).join(".git").exists())
-        .map(|entry| entry.trim_end_matches('/').to_string())
-        .collect();
+    // Nested repositories. `ls-files --stage` cannot see an untracked one:
+    // it has no index entry, yet `git add -A` records it as a gitlink the
+    // moment Sheep snapshots. `--directory` used to keep this cheap, and
+    // also made it blind: git stops at the shallowest untracked directory,
+    // so a repo at `vendor/parser` under an untracked `vendor/` was never
+    // named. Without `--directory`, git descends into untracked parents and
+    // emits the directory itself (trailing slash) only at a repository
+    // boundary it will not cross. `--exclude-standard` keeps ignore rules
+    // honoured, which is invariant 8.
+    //
+    // A nested repo with no commit checked out is a different shape: `git
+    // add -A` fails outright, so snap/diff/restore would die with a raw git
+    // error after doctor had said `ready`. That is a blocker, not a note.
+    let mut nested = Vec::new();
+    let mut unborn = Vec::new();
+    for entry in git.run_z(&["ls-files", "-o", "--exclude-standard", "-z"])? {
+        if !entry.ends_with('/') {
+            continue;
+        }
+        let rel = entry.trim_end_matches('/');
+        let path = wt.root.join(rel);
+        if !path.join(".git").exists() {
+            continue;
+        }
+        if Git::discover(&path).ok(&["rev-parse", "--verify", "--quiet", "HEAD"]) {
+            nested.push(rel.to_string());
+        } else {
+            unborn.push(rel.to_string());
+        }
+    }
+    if !unborn.is_empty() {
+        health.blockers.push(Blocker::NestedRepositoryWithoutCommit(unborn));
+    }
     if !nested.is_empty() {
         health.warnings.push(Warning::NestedRepositories(nested));
     }
