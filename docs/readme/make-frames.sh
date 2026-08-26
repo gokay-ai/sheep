@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# Regenerate the two interface frames in README.md.
+# Regenerate every block in README.md that comes off a recorded timeline: the
+# two interface frames, the plan, the restore and the log it leaves behind.
 #
-# The frames have to be real output, so this builds a throwaway five-turn
-# timeline in a temporary clone of this repository and photographs it with
-# `sheep ui --snapshot`. Nothing outside $TMPDIR is written: the clone, the
-# state directory and the timeline all live under one directory that is removed
-# on the way out.
+# They have to be real output, so this builds a throwaway five-turn timeline in
+# a temporary clone of this repository, photographs it with `sheep ui
+# --snapshot`, and then actually rewinds it. Nothing outside $TMPDIR is written:
+# the clone, the state directory and the timeline all live under one directory
+# that is removed on the way out.
 #
 #   ./docs/readme/make-frames.sh            build, then print both frames
 #   ./docs/readme/make-frames.sh --keep     leave the fixture in place
@@ -86,6 +87,15 @@ echo "=== sheep ui --line claude --rewind --select 4 --keys d --snapshot 92x30 =
 echo
 echo "=== sheep diff --line claude '#4' ==="
 "$sheep" diff --line claude '#4'
+
+# The frames above are taken before anything is written; everything below is
+# after the rewind, which is why it has to come last.
+echo
+echo "=== sheep restore --line claude '#4' --yes ==="
+"$sheep" restore --line claude '#4' --yes
+echo
+echo "=== sheep log --line claude ==="
+"$sheep" log --line claude
 
 [ "$keep" = 1 ] && echo && echo "fixture kept at $work"
 exit 0
