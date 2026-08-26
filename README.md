@@ -91,9 +91,10 @@ Ten seconds is measured rather than guessed, and `sheep watch --help` says where
 from: a live herdr 0.8.0 session was watched flipping a pane to `done` and back to `working` 9.2
 seconds later, with the agent still mid-turn. Anything shorter records that as a turn.
 
-The recorder says what it did in a log file rather than in the pane you are using. Here are thirteen
-minutes of one, from a live session with ten agent panes in it. It was started with `--line-by pane`,
-so the timelines are named after panes rather than after agents, and home paths are shortened:
+The recorder says what it did in a log file rather than in the pane you are using. Below is thirteen
+minutes of one — `sheep watch --verbose --line-by pane`, against a live session with ten agent panes
+in it. `--line-by pane` is why the timelines are named after panes rather than after agents; home
+paths are shortened, and nothing else is edited:
 
 ```console
 $ tail -f ~/.local/state/herdr/plugins/sheep/logs/watch.log
