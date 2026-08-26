@@ -464,4 +464,6 @@ one machine — and telling the agent what changed underneath it.
 
 ---
 
-MIT licensed. The snapshots are yours; `rm -rf` on the state directory removes every trace.
+MIT licensed. Removing it is `herdr plugin uninstall sheep`, then `rm -rf` on the one directory
+`sheep doctor` prints as `state`. Everything Sheep ever wrote was in there, and your repository never
+knew it existed.
