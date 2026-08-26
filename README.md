@@ -87,9 +87,10 @@ pane leaves `working` for `idle`/`done` it opens a *candidate* boundary — and 
 believe it for ten seconds, because herdr infers status from what a pane paints and will call an
 agent `done` in the middle of a turn.
 
-That is not a hypothetical, and the ten seconds is measured rather than guessed. Here is a recorder
-attached to a live ten-pane herdr session, two minutes in — a session with a false `done` in it
-thirty-six seconds after start-up (home paths shortened):
+That is not a hypothetical, and the ten seconds is measured rather than guessed. It says what it did
+in a log file rather than in the pane you are using. Thirteen minutes of one, from a live herdr
+session with ten agent panes in it — started with `--line-by pane`, so the timelines are named after
+panes rather than after agents, and with home paths shortened:
 
 ```console
 $ tail -f ~/.local/state/herdr/plugins/sheep/logs/watch.log
@@ -99,17 +100,21 @@ $ tail -f ~/.local/state/herdr/plugins/sheep/logs/watch.log
 2026-08-26 07:39:51Z info w3K:pZ: baseline #1 on w3K:pZ — 60 file(s) in ~/…/herdr-max-readme
 2026-08-26 07:40:27Z info w3K:p1: withdrawn — the pane went back to working — false done
 2026-08-26 07:41:33Z info w20:p3N: nothing changed on w20:p3N; not recorded
+2026-08-26 07:52:42Z info w3K:p0: still spawning processes; waiting
+2026-08-26 07:52:52Z info w3K:p0: recorded #2 on w3K:p0 — 11 file(s) +1100 -97 in ~/…/herdr-max-projectdocs
 ```
 
-The first thing it does with a pane is take a baseline, because the state *before* an agent's first
-turn is the one you most want back and no boundary announces it. The last two lines are the two ways
-a turn does not get written: herdr said `done`, the recorder waited, and the pane went back to
-`working`; and an agent that answered a question without editing anything.
+Every line there is a decision. The first thing the recorder does with a pane is take a baseline,
+because the state *before* an agent's first turn is the one you most want back and no boundary
+announces it. Thirty-six seconds in, herdr calls `w3K:p1` done, the recorder waits, and the pane goes
+back to `working` — that is the false `done`, and withdrawing is the whole defence against it. An
+agent that answered a question without editing anything gets no row either. And the last two lines
+are one turn: herdr said the pane was at rest, the kernel said its process group was still starting
+things, so the window was extended by ten seconds and the turn recorded after that.
 
 `blocked` withdraws a candidate too — an agent waiting on you has not finished a turn — and so does a
-pane that changed directory while the turn was in flight, because the tree that would be snapshotted
-is no longer the tree the agent worked in. Each refusal names itself in the log. A pane whose process
-group is still starting things does not lose its turn; it just waits longer.
+pane that changed directory mid-turn, because the tree that would be snapshotted is no longer the
+tree the agent worked in.
 
 ### It shows you the plan before it writes anything
 
