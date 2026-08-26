@@ -321,26 +321,26 @@ checkpoint that reverses it.
 
 ## What it costs
 
-Borrowed objects are the whole trick. Measured on this machine, with `SHEEP_STATE_DIR` pointed at a
-scratch directory each time:
+Borrowed objects are the whole trick, and they are why recording every turn of every agent all day
+does not cost anything worth noticing:
+
+| | |
+|---|---|
+| five recorded turns on a 12,000-file, 132 MB checkout | **512 KB** of state |
+| two everyday checkouts, 2.5 GB on disk between them — mostly ignored build output — six turns | **216 KB** of state |
+
+Time, measured on this machine with `SHEEP_STATE_DIR` pointed at a scratch directory each run:
 
 | | snapshot | plan (`sheep diff`) | restore |
 |---|---|---|---|
 | this repository — 60 tracked files | 0.11 s | 0.08 s | 0.27 s |
-| a synthetic checkout — 12,000 files, 132 MB | 1.5 s | 1.5 s | 5.9 s |
-
-And what it keeps:
-
-| | |
-|---|---|
-| five recorded turns on that 12,000-file checkout | **512 KB** of state |
-| two everyday checkouts, 2.5 GB on disk between them — mostly ignored build output — six turns | **216 KB** of state |
+| that synthetic 12,000-file checkout | 1.5 s | 1.5 s | 5.9 s |
 
 A snapshot re-stages the whole tree into a fresh index, so the *time* tracks the size of the checkout
 and not the size of the change; what gets *stored* tracks the change, because everything your
 repository already holds is borrowed rather than copied. A restore stages three more times — once to
 compute the plan, once for the checkpoint that makes it undoable, once to record where you landed —
-which is where the six seconds on the big fixture go, and none of the three is optional.
+which is where the 5.9 s on the big fixture goes, and none of the three is optional.
 
 `sheep gc` is the one command worth knowing about ahead of time. Trimming the turn log alone frees
 nothing, because every old commit stays reachable through the parent chain; `gc` rebuilds the kept
