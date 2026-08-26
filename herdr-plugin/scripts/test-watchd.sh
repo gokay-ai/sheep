@@ -83,15 +83,17 @@ check_settles() {
 }
 
 # Called by `cleanup`, which the EXIT trap calls. Neither hop is one a static
-# checker can follow, hence the directive.
-# shellcheck disable=SC2329
+# checker can follow. SC2329 is the unused-function warning; SC2317 is the
+# same fact reported against every command inside — Ubuntu's shellcheck
+# emits the latter, Homebrew 0.11 the former.
+# shellcheck disable=SC2317,SC2329
 sweep() {
   pgrep -u "$(id -u)" -f "$plugin_root/bin/sheep watch" 2>/dev/null |
     while read -r stray; do kill "$stray" 2>/dev/null || true; done
   wait 2>/dev/null || true
 }
 
-# shellcheck disable=SC2329
+# shellcheck disable=SC2317,SC2329
 cleanup() {
   sweep
   rm -rf "$sandbox"
