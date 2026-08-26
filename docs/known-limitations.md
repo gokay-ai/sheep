@@ -37,7 +37,13 @@ A git repository inside your worktree — a vendored checkout, or a directory an
 `git init` in — is recorded the way git records it: as a commit pointer and nothing else. Sheep
 captures nothing inside it, restores nothing inside it, and **refuses** any restore that would
 remove or overwrite it, because the contents are in no snapshot and the checkpoint could not
-bring them back. `sheep doctor` names them before you start.
+bring them back.
+
+`sheep doctor` names them before you start, but only the ones git lists for it. The scan reads
+`ls-files -o --directory`, which stops at the shallowest untracked directory — so a repository
+under an untracked parent (`vendor/` untracked, `vendor/parser` a repository) is not named. The
+refusal is unaffected: it is decided at the moment of the write, against what is on disk, not
+against what doctor found.
 
 ## Ignored files
 
