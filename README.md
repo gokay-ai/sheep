@@ -176,7 +176,7 @@ timeline claude · 5 turns · newest 1m ago · notify on
 The same plan on the command line, which touches nothing either:
 
 ```console
-$ sheep diff '#4'
+$ sheep diff --line claude '#4'
 restore to f944f1ef431a  ·  10 file(s) written, 0 removed
   write   src/git.rs
   write   src/herdr/detect.rs
@@ -204,7 +204,7 @@ turn that records where you landed, so the log describes what is on disk rather 
 for.
 
 ```console
-$ sheep log
+$ sheep log --line claude
 #7    9ba4396fb2cf  manual       10 files  +75     -10     restored to f944f1ef431a
 #6    9766acafdf0d  checkpoint    0 files  +0      -0      before restore to f944f1ef431a
 #5    90f73711129f  manual       10 files  +10     -75     extract the retry helper and use it everywhere
@@ -260,12 +260,10 @@ of it back. Sheep refuses before touching anything:
 
 ```console
 $ sheep restore '#1' --yes
-restore to 9e11dca6131e  ·  0 file(s) written, 1 removed
+restore to 1fafe0b4337f  ·  0 file(s) written, 1 removed
   remove  vendor/parser
-sheep: the restore failed: refusing to restore: `vendor/parser` is a directory whose contents
-Sheep never captured. A git repository inside your worktree is recorded only as a pointer, so
-removing it here would delete files no snapshot holds — including anything ignored inside it.
-Move or delete it yourself if that is what you want.. Your files were put back as they were.
+sheep: the restore failed: refusing to restore: `vendor/parser` is a directory whose contents Sheep never captured.
+A git repository inside your worktree is recorded only as a pointer, so removing it here would delete files no snapshot holds — including anything ignored inside it. Move or delete it yourself if that is what you want.. Your files were put back as they were.
 ```
 
 → `a_nested_repository_is_never_deleted_by_a_restore`, `a_nested_repository_is_not_clobbered_by_a_write_either`
@@ -331,14 +329,19 @@ does not cost anything worth noticing:
 
 | | |
 |---|---|
-| five recorded turns on a 12,000-file, 132 MB checkout | **512 KB** of state |
-| two everyday checkouts, 2.5 GB on disk between them — mostly ignored build output — six turns | **216 KB** of state |
+| six turns on this repository, built — 716 MB on disk, 61 files tracked | **192 KB** of state |
+| five turns on a synthetic checkout of 12,000 files, 132 MB | **512 KB** of state |
+
+<sup>The first is a clone plus `cargo build --release`, then six snapshots with a line appended to
+`src/lib.rs` between them: almost all of the 716 MB is `target/`, which is ignored and never enters a
+snapshot in either direction. The second is 12,000 generated files of 120–260 lines each, five turns,
+twelve files changed per turn.</sup>
 
 Time, measured on this machine with `SHEEP_STATE_DIR` pointed at a scratch directory each run:
 
 | | snapshot | plan (`sheep diff`) | restore |
 |---|---|---|---|
-| this repository — 60 tracked files | 0.11 s | 0.08 s | 0.27 s |
+| this repository — 61 tracked files | 0.11 s | 0.08 s | 0.27 s |
 | that synthetic 12,000-file checkout | 1.5 s | 1.5 s | 5.9 s |
 
 A snapshot re-stages the whole tree into a fresh index, so the *time* tracks the size of the checkout
@@ -349,9 +352,10 @@ which is where the 5.9 s on the big fixture goes, and none of the three is optio
 
 `sheep gc` is the one command worth knowing about ahead of time. Trimming the turn log alone frees
 nothing, because every old commit stays reachable through the parent chain; `gc` rebuilds the kept
-turns as a fresh chain against the same trees and only then collects. On a 32-turn timeline,
-`--keep 10` took the shadow repository from 65.2 KB to 34.2 KB — and turn #28 restored to a
-byte-identical tree before and after, which is what
+turns as a fresh chain against the same trees and only then collects. Put 32 turns on a clone of this
+repository — one line appended to `src/lib.rs` each time — and `--keep 10` takes the shadow repository
+from 65.0 KB to 34.7 KB. Do it in two clones, collect only one of them, and turn #28 restores to a
+byte-identical tree in both; that is what
 `a_kept_turn_still_restores_to_the_same_files_after_collection` asserts in general. `--keep 500` and
 `--max-age-days 30` by default, dry run unless `--yes`.
 
@@ -460,7 +464,9 @@ cargo clippy --all-targets -- -D warnings && cargo fmt --check
 CI runs fmt, clippy and the tests on Linux and macOS — the two platforms Sheep claims — plus
 shellcheck, an installer round trip that asserts `install.sh` and the release matrix ask for exactly
 the same asset names, and eight concurrent `watchd start`s that have to leave exactly one recorder
-running. Releases are built natively for five targets with one `SHA256SUMS`.
+running. Releases cover five targets under one `SHA256SUMS`: four built natively, and
+`x86_64-apple-darwin` cross-compiled on the arm64 macOS runner, which is the only cross-compilation
+in the matrix.
 
 ## What Sheep does not do
 
@@ -480,9 +486,14 @@ behind it: on Windows every call fails, `sheep watch` cannot record a single tur
 it would sit there saying nothing had happened. Sheep used to declare Windows in its manifest and
 ship a whole PowerShell surface for it anyway, behind a recorder that reported "started" and exited
 0. That is gone; `sheep watch` now refuses on a non-unix build instead of looping quietly, no `.exe`
-is published, and there is no Windows CI leg. It comes back with the transport. The command-line half
-is pure git plumbing and would very likely be fine there today — but "very likely" is not a supported
-platform, and `sheep`'s state directory has no `%LOCALAPPDATA%` fallback yet.
+is published, and there is no Windows CI leg. It comes back with the transport.
+
+The command-line half is a different story, and closer than you would guess: it is pure git plumbing,
+and the state directory already knows where to go on Windows — `%LOCALAPPDATA%`, then `%USERPROFILE%`,
+and neither of them beaten by a `HOME` that Git Bash invented, which
+`windows_has_somewhere_to_put_it_without_home` pins down. So `sheep snap` and `sheep restore` would
+very likely work there today. But nothing has ever run them there, and the thing that would tell us
+otherwise is the CI leg that does not exist, so "very likely" stays exactly what it is.
 
 ## Prior art, and thanks
 

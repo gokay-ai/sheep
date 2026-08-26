@@ -78,13 +78,13 @@ for path in files:
 PY
 snap "extract the retry helper and use it everywhere"
 
-echo "=== sheep ui --snapshot 92x18 ==="
+echo "=== sheep ui --line claude --snapshot 92x18 ==="
 "$sheep" ui --line claude --snapshot 92x18
 echo
-echo "=== sheep ui --rewind --select 4 --keys d --snapshot 92x30 ==="
+echo "=== sheep ui --line claude --rewind --select 4 --keys d --snapshot 92x30 ==="
 "$sheep" ui --line claude --rewind --select 4 --keys d --snapshot 92x30
 echo
-echo "=== sheep diff '#4' ==="
+echo "=== sheep diff --line claude '#4' ==="
 "$sheep" diff --line claude '#4'
 
 [ "$keep" = 1 ] && echo && echo "fixture kept at $work"
