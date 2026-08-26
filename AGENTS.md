@@ -37,8 +37,9 @@ bash herdr-plugin/scripts/test-install.sh     # installer platform detection vs 
 bash herdr-plugin/scripts/test-watchd.sh      # "exactly one recorder" under concurrent starts
 ```
 
-`test-watchd.sh` refuses to run while a real recorder is alive, because the sweep it exercises
-would take it.
+`test-watchd.sh` builds its own plugin root and its own stand-in recorder and scopes every match
+to that path, so a real `sheep watch` on the machine is neither counted nor killed. Neither script
+needs a herdr session.
 
 ### Always set `SHEEP_STATE_DIR` when you run the binary by hand
 

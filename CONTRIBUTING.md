@@ -35,8 +35,8 @@ bash herdr-plugin/scripts/test-install.sh    # the installer and the release mat
 bash herdr-plugin/scripts/test-watchd.sh     # exactly one recorder survives eight concurrent starts
 ```
 
-`test-watchd.sh` refuses to run while a real recorder is alive, because the sweep it exercises
-would take it down.
+`test-watchd.sh` builds its own plugin root and stand-in recorder and matches only on that path,
+so a real `sheep watch` on your machine is neither counted nor killed by it.
 
 Most of the suite needs nothing but `git`. The recorder and the interface are tested against a
 scripted herdr and `ratatui`'s `TestBackend`, so no pseudo-terminal and no herdr session is
