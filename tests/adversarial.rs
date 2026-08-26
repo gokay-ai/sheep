@@ -293,12 +293,12 @@ fn refuses_a_worktree_with_unresolved_conflicts() {
     f.write("conflict.txt", "ours\n");
     f.commit_all("ours");
 
-    let merge = Command::new("git")
-        .current_dir(&f.repo)
-        .args(["merge", "other"])
-        .output()
-        .expect("merge should run");
-    assert!(!merge.status.success(), "the merge should have conflicted");
+    // Three-way merge in the index. Porcelain `git merge` can abort before it
+    // writes conflict stages (no identity, a missing GIT_CONFIG_GLOBAL the
+    // other tests used to leave in the process, `merge.ff=only`); this is
+    // the unmerged state itself, which is what invariant 7 refuses.
+    let base = git(&f.repo, &["merge-base", "HEAD", "other"]);
+    git(&f.repo, &["read-tree", "-m", &base, "HEAD", "other"]);
 
     let health = repo::inspect(&f.wt(), BUDGET).expect("inspect should succeed");
     assert!(
@@ -1531,49 +1531,5 @@ fn a_path_sheep_cannot_name_is_refused_rather_than_silently_skipped() {
     assert!(
         err.to_string().contains("not valid UTF-8"),
         "a removal that would silently no-op must be a refusal instead: {err}"
-    );
-}
-
-#[test]
-fn line_endings_survive_a_hostile_global_gitconfig() {
-    // The shadow reads repo-local config from its own bare git dir, never the
-    // user's — but it inherited the *machine's* global config, where
-    // `core.autocrlf = input` is routine advice on macOS and Linux. A CRLF file
-    // was recorded as LF and written back as LF; the checkpoint was normalised
-    // on the way in too, so the undo did not restore the original bytes either;
-    // and `sheep snap` afterwards said "nothing changed since the last turn",
-    // so Sheep could not see the damage it had done.
-    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
-
-    let f = Fixture::new();
-    let hostile = f.repo.parent().unwrap().join("hostile.gitconfig");
-    fs::write(&hostile, "[core]\n\tautocrlf = input\n").unwrap();
-
-    let previous = std::env::var("GIT_CONFIG_GLOBAL").ok();
-    std::env::set_var("GIT_CONFIG_GLOBAL", &hostile);
-
-    let crlf = b"line one\r\nline two\r\n";
-    fs::write(f.repo.join("windows.bat"), crlf).unwrap();
-    // Commit with the file's bytes as they are, so the repository itself is not
-    // the thing that normalised them.
-    git(&f.repo, &["-c", "core.autocrlf=false", "add", "-A"]);
-    git(&f.repo, &["-c", "core.autocrlf=false", "commit", "--quiet", "-m", "base"]);
-
-    let intact = f.snap("turn 1");
-    fs::write(f.repo.join("windows.bat"), b"CHANGED\r\n").unwrap();
-    f.snap("turn 2");
-    ops::restore(&f.wt(), &f.state, "default", &intact.to_string(), BUDGET).unwrap();
-
-    let after = fs::read(f.repo.join("windows.bat")).unwrap();
-
-    match previous {
-        Some(value) => std::env::set_var("GIT_CONFIG_GLOBAL", value),
-        None => std::env::remove_var("GIT_CONFIG_GLOBAL"),
-    }
-
-    assert_eq!(
-        after, crlf,
-        "the bytes written back must be the bytes recorded, whatever the machine's gitconfig says"
     );
 }

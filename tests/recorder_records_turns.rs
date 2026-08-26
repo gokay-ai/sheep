@@ -1319,8 +1319,11 @@ fn a_pane_still_painting_is_watched_even_while_herdr_forgets_its_agent() {
         status("w1:p1", "claude", &repo, "idle", 11),
     ];
     // Painting for longer than a whole window, with no agent on any of it.
+    // The rest is a quarter of `settle`, not a half: a loaded runner can
+    // spend most of 60 ms scheduling the next event, and then the window
+    // expires between paints that were supposed to restart it.
     for step in 0..6 {
-        steps.push(Step::Rest(SETTLE_MS / 2));
+        steps.push(Step::Rest(SETTLE_MS / 4));
         steps.push(unattributed_paint("w1:p1", &repo, 12 + step));
     }
     steps.push(probe);
