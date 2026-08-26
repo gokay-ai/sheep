@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Regenerate every block in README.md that comes off a recorded timeline: the
-# two interface frames, the plan, the restore and the log it leaves behind.
+# Photograph the dock (and the rewind overlay) off a recorded timeline, for the
+# README. The plan, the restore and the log it leaves behind print after that.
 #
 # They have to be real output, so this builds a throwaway five-turn timeline in
 # a temporary clone of this repository, photographs it with `sheep ui
