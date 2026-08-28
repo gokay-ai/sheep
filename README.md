@@ -8,18 +8,19 @@
   <img alt="MIT licence" src="https://img.shields.io/badge/licence-MIT-blue">
 </p>
 
+<p align="center">Linux and macOS · <a href="https://herdr.dev">herdr</a> 0.8+</p>
+
 <p align="center">
   <img src="docs/readme/hero.jpg" alt="A sheep at a time-rewind machine, an agent in the wreckage behind it" width="800">
 </p>
 
-[herdr](https://herdr.dev) runs coding agents in panes, a git worktree each. Sheep records every
-turn as a checkpoint, rewinds **that** worktree, and tells the agent what was taken back.
+An agent just rewrote a pile of files. `prefix+f`, pick the turn before it, `shift+R`. Sheep rewinds **that** worktree — not the others — and writes a `[sheep]` prompt into the pane so the agent does not keep editing a tree that is gone.
 
-<p align="center">
-  <img src="docs/readme/restore.jpg" alt="A sheep inspects a catastrophic commit while another hits rewind" width="800">
-</p>
-
-Linux and macOS.
+- **Every turn is a checkpoint.** The recorder files one when the agent finishes. No `snap` unless you want one by hand.
+- **One worktree, one rewind.** herdr gave that agent its own tree. Sheep only restores that tree, and only the paths in the plan you just read.
+- **Notify is on.** After a restore, the agent is told which turn you went back to, how many paths moved, and to re-read before it edits. Press `n` to mute it.
+- **Dry run is the product.** Nothing is written until `shift+R` (or `--yes`). A restore that fails partway is put back. The undo is itself a turn.
+- **Never writes your `.git`.** Ignored files (`.env`, `node_modules/`) are never captured and never overwritten.
 
 ## Install
 
@@ -27,20 +28,27 @@ Linux and macOS.
 herdr plugin install gokay-ai/sheep/herdr-plugin
 ```
 
-The installer fetches a checksum-verified binary, starts the recorder, registers the dock,
-puts `sheep` on PATH at `~/.local/bin/sheep`, and binds `prefix+F` (dock) and `prefix+f`
-(rewind) in your herdr config. No Rust needed. Those chords are not herdr defaults, so
-zoom stays on `prefix+z`.
+Checksum-verified binary. No Rust. Recorder, dock, and keys land in one command.
 
-If the shell says `command not found`, `~/.local/bin` is not on PATH — herdr's own installer
-adds it; open a new terminal, or add it yourself. If a herdr session is already running,
-`herdr server reload-config` picks up the keys.
+If herdr is already running: `herdr server reload-config`.
+`command not found` means `~/.local/bin` is not on PATH.
 
-Without herdr, download a release asset onto PATH, or
-`cargo install --git https://github.com/gokay-ai/sheep --locked`. `sheep` still works in any
-git checkout.
+## Keys
 
-## Usage
+| herdr | action |
+|---|---|
+| `prefix+F` | dock |
+| `prefix+f` | rewind |
+
+Neither chord is a herdr default.
+
+| dock | action |
+|---|---|
+| `j` `k` | move |
+| `enter` | plan |
+| `shift+R` | restore |
+| `n` | notify on/off |
+| `?` | all keys |
 
 ```text
  sheep  sheep                                                                          ready
@@ -63,40 +71,35 @@ timeline claude · 5 turns · newest just now · notify on
 j/k move · enter rewind · ? keys · q quit · n notify · r refresh
 ```
 
-In the dock: `j`/`k` move, `enter` opens a plan, `shift+R` restores. Dry run is the default;
-nothing is written until you confirm.
+<p align="center">
+  <img src="docs/readme/restore.jpg" alt="A sheep inspects a catastrophic commit while another hits rewind" width="800">
+</p>
+
+## Configure
+
+Keys live in `~/.config/herdr/config.toml` under `# --- sheep-keys ---`. Edit a `key =` line, then `herdr server reload-config`.
+
+```toml
+[[keys.command]]
+key = "prefix+f"
+type = "plugin_action"
+command = "sheep.rewind"
+
+[[keys.command]]
+key = "prefix+F"
+type = "plugin_action"
+command = "sheep.dock"
+```
+
+## CLI
 
 ```bash
-sheep doctor             # is this worktree safe to record
-sheep snap               # record a turn by hand
+sheep doctor             # is this worktree safe
 sheep log                # the timeline
-sheep diff '#4'          # what restoring turn 4 would do
-sheep restore '#4' --yes # go back
-sheep ui --rewind        # the same decision, with the diff in front of you
-sheep gc --yes           # shorten history
+sheep diff '#3'          # what restoring would do
+sheep restore '#3' --yes # go back
 ```
-
-Quote `'#4'` so the shell does not eat it. `--line` picks a timeline; `sheep watch` names one per
-agent per worktree.
-
-After a restore the agent is told what changed, and the state you were in is kept as a new turn —
-so the undo is itself undoable.
-
-## Uninstall
-
-```bash
-herdr plugin uninstall sheep
-```
-
-The CLI on PATH is left in place, so `sheep doctor` still prints `state`. The keybindings
-stay in `~/.config/herdr/config.toml` until you delete the `sheep-keys` block. Then:
-
-```bash
-rm -rf <that state directory>
-rm -f ~/.local/bin/sheep
-```
-
-Your `.git` is never written. Ignored files (`.env`, `node_modules/`) are never captured and
-never overwritten.
 
 MIT. How it works: [`docs/architecture.md`](docs/architecture.md). Contributing: [`AGENTS.md`](AGENTS.md).
+
+Uninstall: `herdr plugin uninstall sheep`. Delete the `sheep-keys` block and `~/.local/bin/sheep` yourself. Without herdr, download a [release](https://github.com/gokay-ai/sheep/releases/latest).
