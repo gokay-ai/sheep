@@ -827,6 +827,26 @@ fn scripted_keys_cannot_reach_a_write() {
 }
 
 #[test]
+fn leaving_the_ui_leaves_a_line_the_main_screen_can_show() {
+    // `sheep ui` draws on the alternate screen. Quitting restores the main
+    // buffer, which then looks as if the command printed nothing. The residue
+    // is what a paste of the session can actually show.
+    let empty = cli::leave_line("default", 0);
+    assert!(empty.contains("`default`"), "{empty}");
+    assert!(empty.contains("sheep snap"), "{empty}");
+    assert!(!empty.contains("sheep log"), "{empty}");
+
+    let some = cli::leave_line("claude", 3);
+    assert!(some.contains("`claude`"), "{some}");
+    assert!(some.contains("3 turns"), "{some}");
+    assert!(some.contains("sheep log"), "{some}");
+
+    let one = cli::leave_line("claude", 1);
+    assert!(one.contains("1 turn."), "{one}");
+    assert!(!one.contains("turns"), "{one}");
+}
+
+#[test]
 fn the_only_scripted_key_refused_is_the_one_that_writes() {
     assert_eq!(cli::scripted_key('R'), None);
     assert_eq!(cli::scripted_key('r'), Some(Key::Char('r')));

@@ -14,6 +14,7 @@ use super::wire;
 use crate::repo::{self, DEFAULT_MAX_FILES};
 use anyhow::{bail, Result};
 use clap::Args;
+use std::io::IsTerminal;
 use std::time::{Duration, Instant};
 
 /// How often to re-read herdr's own view of every agent, healing whatever the
@@ -54,6 +55,10 @@ pub struct WatchArgs {
     pub file_budget: usize,
 
     /// Mirror the log to stdout as well as the log file.
+    ///
+    /// Implied when stderr is a terminal, so a hand-run `sheep watch` is not a
+    /// blank hang. The plugin starts the recorder with stdout and stderr
+    /// redirected, so the daemon stays silent in the pane.
     #[arg(long)]
     pub verbose: bool,
 }
@@ -90,8 +95,14 @@ pub fn run(args: &WatchArgs) -> Result<()> {
     }
 
     let state = repo::state_dir()?;
-    // A dry run has to leave nothing behind, log file included.
-    let log = if args.dry_run { Log::to_stdout() } else { Log::open(&state, args.verbose)? };
+    // A dry run has to leave nothing behind, log file included. A hand-run in a
+    // terminal echoes even without `--verbose`: otherwise the command sits there
+    // looking hung while it writes to a file nobody asked to tail.
+    let log = if args.dry_run {
+        Log::to_stdout()
+    } else {
+        Log::open(&state, echo_watch_log(args.verbose, std::io::stderr().is_terminal()))?
+    };
 
     let config = Config {
         dry_run: args.dry_run,
@@ -143,5 +154,27 @@ pub fn run(args: &WatchArgs) -> Result<()> {
             }
             Next::Retry(delay) => std::thread::sleep(delay),
         }
+    }
+}
+
+/// Whether `sheep watch` prints as it runs.
+///
+/// The recorder is silent in the plugin: `watchd.sh` starts it with stdout and
+/// stderr redirected, so `stderr_is_tty` is false and a pane the user is
+/// looking at does not fill with log lines. A human who types `sheep watch` is
+/// staring at a blank hang unless we echo; that is the other case.
+fn echo_watch_log(verbose: bool, stderr_is_tty: bool) -> bool {
+    verbose || stderr_is_tty
+}
+
+#[cfg(test)]
+mod tests {
+    use super::echo_watch_log;
+
+    #[test]
+    fn a_hand_run_watch_echoes_and_a_daemon_does_not() {
+        assert!(echo_watch_log(false, true), "a terminal must not be a blank hang");
+        assert!(!echo_watch_log(false, false), "watchd redirects stdio; stay silent");
+        assert!(echo_watch_log(true, false), "--verbose still works when redirected");
     }
 }

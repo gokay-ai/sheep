@@ -13,7 +13,7 @@ use crate::tui::engine::{self, Ctx, Worker};
 use crate::tui::render;
 use crate::tui::runtime;
 use crate::tui::text;
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use clap::Args;
 use crossterm::event::{self, Event, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{
@@ -22,7 +22,7 @@ use crossterm::terminal::{
 use crossterm::ExecutableCommand;
 use ratatui::backend::{CrosstermBackend, TestBackend};
 use ratatui::Terminal;
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::Path;
 use std::time::Duration;
 
@@ -209,13 +209,35 @@ fn print_snapshot(app: &App, spec: &str) -> Result<()> {
 // --------------------------------------------------------------- interactive
 
 fn interact(mut app: App, ctx: Option<Ctx>) -> Result<()> {
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        bail!(
+            "`sheep ui` needs an interactive terminal.\n`sheep log` lists turns; `sheep ui --snapshot 92x18` prints one frame."
+        );
+    }
     let mut screen = Frames(enter()?);
     let worker = ctx.map(|ctx| Worker::spawn(ctx, POLL));
     let result = runtime::run(&mut app, &mut screen, &mut Keyboard, &worker, &shadow::now);
     // Put the terminal back whatever happened, but never let a failure to do so
     // hide the reason the loop stopped.
     let restored = leave(&mut screen.0);
+    // The alternate screen is gone. Without a line on the main buffer, a
+    // terminal that just showed the dock and jumped back looks as if the
+    // command did nothing — which is exactly how `sheep ui` read in a paste.
+    eprintln!("sheep: {}", leave_line(&app.line, app.turns.len()));
     result.and(restored)
+}
+
+/// The one-line residue `sheep ui` leaves on the main screen after the
+/// alternate buffer is gone.
+pub fn leave_line(line: &str, turns: usize) -> String {
+    if turns == 0 {
+        format!("nothing recorded on `{line}` yet. `sheep snap` takes a checkpoint.")
+    } else {
+        format!(
+            "timeline `{line}` · {turns} turn{}. `sheep log` lists them.",
+            if turns == 1 { "" } else { "s" }
+        )
+    }
 }
 
 /// The terminal, as the loop sees it.

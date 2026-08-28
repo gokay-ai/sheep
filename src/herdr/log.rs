@@ -3,8 +3,9 @@
 //! `sheep watch` runs for a whole day in a pane the user is also looking at.
 //! Anything it prints to stdout lands in the middle of whatever else is there,
 //! so the recorder writes to a file under the plugin state directory and stays
-//! silent otherwise. `--dry-run` and `--verbose` mirror it to stdout, because
-//! then the output *is* the point.
+//! silent when started detached (stdout and stderr redirected). A hand-run in a
+//! terminal echoes the same lines — `--verbose` forces that even when
+//! redirected, and `--dry-run` prints instead of writing a file.
 
 use anyhow::{Context, Result};
 use std::fs::OpenOptions;

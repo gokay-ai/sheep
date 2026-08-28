@@ -79,8 +79,14 @@ enum Command {
         yes: bool,
     },
     /// Watch the herdr session and record a turn whenever an agent finishes one.
+    ///
+    /// Stays in the foreground until Ctrl-C. Typed in a terminal, it prints
+    /// what it records; the plugin starts it detached so a pane stays quiet.
     Watch(sheep::herdr::WatchArgs),
     /// Open Sheep's terminal interface: the timeline dock, or the rewind picker.
+    ///
+    /// Needs an interactive terminal; `q` quits. `--snapshot COLSxROWS` prints
+    /// one frame and exits.
     Ui(sheep::tui::UiArgs),
 }
 

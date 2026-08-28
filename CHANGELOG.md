@@ -21,6 +21,10 @@ Nothing has been tagged yet. This is what `v0.1.0` will contain.
 - `-C/--repo`, `--line` (also `SHEEP_LINE`), `--max-files` (60,000 by default).
 - `SHEEP_STATE_DIR` chooses where state lives; precedence is `HERDR_PLUGIN_STATE_DIR` >
   `SHEEP_STATE_DIR` > `XDG_STATE_HOME` > the platform's home.
+- `sheep watch` typed in a terminal prints what it records, instead of sitting there looking hung
+  while it writes to a log file. The plugin still starts it detached and silent.
+- `sheep ui` refuses when stdin or stdout is not a terminal, and leaves one line on the main screen
+  after quitting so a session paste does not look as if the command did nothing.
 
 ### The recorder
 
@@ -34,7 +38,8 @@ Nothing has been tagged yet. This is what `v0.1.0` will contain.
 ### The interface
 
 - `sheep ui` is the timeline dock; `sheep ui --rewind` is the plan-and-restore overlay. A restore is
-  reachable only from a plan that is on the screen, and only with `shift+R`.
+  reachable only from a plan that is on the screen, and only with `shift+R`. Needs a real terminal;
+  `--snapshot` prints one frame without one.
 - After a restore, the agent in that pane is told over herdr's `agent.prompt` what was taken back
   and which turn puts it back. Outside herdr this is a no-op.
 - `sheep ui --snapshot <cols>x<rows>` writes one frame to stdout as plain text.

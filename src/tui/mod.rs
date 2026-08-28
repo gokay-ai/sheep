@@ -34,4 +34,4 @@ pub mod text;
 pub mod theme;
 
 pub use app::{App, Key, Mode};
-pub use cli::UiArgs;
+pub use cli::{leave_line, UiArgs};
