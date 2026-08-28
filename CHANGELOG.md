@@ -7,7 +7,12 @@ files?*
 
 ## Unreleased
 
-Nothing has been tagged yet. This is what `v0.1.0` will contain.
+Nothing yet.
+
+## 0.1.1 — 2026-08-28
+
+First release of the current product. `v0.1.0` tagged the crate metadata; this
+tag is the binary `herdr plugin install` fetches.
 
 ### The command line
 

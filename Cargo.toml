@@ -1,6 +1,6 @@
 [package]
 name = "sheep"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.85"
 description = "Undo for AI coding agents. Every agent turn becomes a restorable checkpoint."

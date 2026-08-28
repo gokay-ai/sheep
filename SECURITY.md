@@ -23,7 +23,8 @@ Useful in a report, roughly in order:
    [`tests/adversarial.rs`](tests/adversarial.rs) is built that way, so one that shape can go
    straight into the suite.
 
-There is no tagged release yet, so the supported version is whatever is on `main`.
+The supported release is the latest tag on <https://github.com/gokay-ai/sheep/releases>.
+`main` may be ahead of it.
 
 ## Threat model
 
